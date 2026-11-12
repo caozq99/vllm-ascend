@@ -43,8 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwis
     get_physical_layer_index,
 )
 
-# NPUModelRunner._allocate_int8_cache_tensor reserves this many extra bytes
-# per backing when KV transfer requires a 2 MiB aligned address.
+# Fixed over-allocation used by the transfer-aligned KV backing allocator.
 GLM5_NEXT_CACHE_ALIGNMENT = 2 * 1024 * 1024
 
 
