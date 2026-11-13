@@ -114,10 +114,18 @@ Do not set `sparse_kv_offload_config` on Prefill. The
 | `layerwise_num_shared_buffers` | Defaults to the number of cache-bearing layers, so omitting it does not enable cross-layer buffer reuse. Set a smaller count, such as `3`, to enable reuse. This sets the initial slot count per block-stride bucket. If all slots conflict, the planner adds a reusable slot. Unused slots need no allocation. Independent layers keep dedicated buffers. |
 | `layerwise_independent_layers` | Layers that keep dedicated buffers. The default is `[0]`; `"all"` disables cross-layer reuse. |
 
+Qwen4Exp uses the same layerwise planner and transfer path as GLM-5.3-Flash.
+Its model rules enable reuse for QSA main K/V, GDN conv/recurrent state, and
+compressed indexer K/V. Raw indexer, PLE, hidden-state, independent-layer, and
+draft caches retain resident regions. GDN reuse requires `mamba_cache_mode=align`
+with no prefill checkpoint blocks. The shared planner packs eligible caches
+within each block-stride bucket and waits for all predecessor saves before
+overwriting a reused region.
+
 The following log confirms that buffer reuse is enabled:
 
 ```text
-Layerwise KV cache reuse merged ... descriptors into ... descriptors using ... buffer assignments.
+Layerwise reuse uses one ...-byte device backing; independent layers=...
 ```
 
 ## 3. Sparse KV Cache Offload on Decode
