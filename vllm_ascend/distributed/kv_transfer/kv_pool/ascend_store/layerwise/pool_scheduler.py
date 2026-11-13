@@ -39,7 +39,15 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
                 request_tracker.token_len = min(request_tracker.token_len, len(tokens))
         if self.layerwise_offload and request_tracker.layerwise_request_id is None:
             request_tracker.layerwise_request_id = uuid4().hex
-        return super()._build_req_meta(request_tracker, *args, **kwargs)
+        meta = super()._build_req_meta(request_tracker, *args, **kwargs)
+        if meta is not None and self.use_layerwise_transfer and self.layerwise_offload and request_tuple is not None:
+            request = request_tuple[0]
+            meta.needs_private_snapshot = not (
+                meta.target_token_len == meta.num_prompt_tokens
+                and not request.resumable
+                and request.num_output_tokens + 1 + (request.num_output_placeholders > 0) >= request.max_tokens
+            )
+        return meta
 
     def __init__(
         self,
@@ -115,11 +123,8 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
                     max(reuse_layout.layer_cache_specs) + 1,
                 )
             self.layerwise_offload = reuse_layout.has_layer_reuse
-        else:
-            self.layerwise_offload = build_layerwise_cache_layout(
-                self.num_layers,
-                extra_config,
-            ).has_layer_reuse
+            return
+        self.layerwise_offload = build_layerwise_cache_layout(self.num_layers, extra_config).has_layer_reuse
 
     def get_running_target_token_len(self, request: Request, num_new_tokens: int) -> int:
         target_token_len = request.num_computed_tokens + num_new_tokens

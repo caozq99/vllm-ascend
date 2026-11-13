@@ -111,7 +111,7 @@ Do not set `sparse_kv_offload_config` on Prefill. The
 
 | Parameter | Description |
 | :--- | :--- |
-| `layerwise_num_shared_buffers` | Defaults to the number of cache-bearing layers, so omitting it does not enable cross-layer buffer reuse. Explicitly set a smaller count, such as `3`, to enable reuse. Independent layers keep dedicated buffers in addition to this shared-buffer budget; unused slots are not allocated. |
+| `layerwise_num_shared_buffers` | Defaults to the number of cache-bearing layers, so omitting it does not enable cross-layer buffer reuse. Set a smaller count, such as `3`, to enable reuse. This sets the initial slot count per block-stride bucket. If all slots conflict, the planner adds a reusable slot. Unused slots need no allocation. Independent layers keep dedicated buffers. |
 | `layerwise_independent_layers` | Layers that keep dedicated buffers. The default is `[0]`; `"all"` disables cross-layer reuse. |
 
 The following log confirms that buffer reuse is enabled:

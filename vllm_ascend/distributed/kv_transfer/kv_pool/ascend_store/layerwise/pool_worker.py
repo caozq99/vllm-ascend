@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import suppress
 from dataclasses import replace
+from itertools import chain
 from typing import Any, cast
 
 import numpy as np
@@ -55,8 +56,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_trans
     LayerBatchBuilder,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
+    LayerwiseCacheConfig,
     LayerwiseReuseLayout,
-    build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
     get_layerwise_kv_cache_specs,
     get_layerwise_reuse_config,
@@ -140,6 +141,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         )
         self.use_layerwise_transfer = self.layerwise_data_plane == "gva"
         self._step_load_keys: set[str] = set()
+        self._snapshot_keys: dict[str, dict[int, dict[int, tuple[int, str]]]] = {}
         super()._init_kv_transfer_config(vllm_config, extra_config, use_layerwise, kv_cache_config)
         self.block_key_hybrid = self.use_block_key_layerwise and self.use_hybrid
         self._dspark_draft_layer_names = (
@@ -216,7 +218,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         self.physical_layer_to_group_layers: dict[int, list[tuple[int, int]]] = {}
         self._global_to_local_layer: dict[int, int] = {}
         self._layerwise_reuse_layout: LayerwiseReuseLayout | None = None
+        self._reused_layers_by_group: dict[int, set[int]] = {}
         self._recurrent_layers: set[int] = set()
+        stage_num_layers = self.num_layers
+        base_layers = getattr(self.hf_config, "num_hidden_layers", stage_num_layers)
         # Defaults for partial initialization (unit tests construct the worker
         # without the full _init_parallelism_info path).
         if not hasattr(self, "layerwise_key_layers"):
@@ -248,26 +253,22 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             draft_names = getattr(self, "_dspark_draft_layer_names", ())
             layer_specs = get_layerwise_kv_cache_specs(self.kv_cache_config)
             target_specs = {name: spec for name, spec in layer_specs.items() if name not in draft_names}
-            base_layers = getattr(
-                self.hf_config,
-                "num_hidden_layers",
-                self.num_layers,
-            )
+            base_layers = getattr(self.hf_config, "num_hidden_layers", self.num_layers)
             if getattr(self.kv_cache_config, "layerwise_draft_layer_names", ()):
                 self.num_layers = base_layers
                 self.layerwise_key_layers = base_layers
             if self.use_layerwise_transfer or self.use_mooncake_offload:
                 self._layerwise_reuse_layout = getattr(self.kv_cache_config, "layerwise_reuse_layout", None)
                 if self._layerwise_reuse_layout is None:
+                    # Unregistered models retain the existing Mooncake topology
+                    # fallback; registered models arrive with a compiled plan.
                     self._layerwise_reuse_layout = build_layerwise_reuse_layout(
-                        target_specs,
-                        base_layers,
-                        self._extra_config,
+                        target_specs, base_layers, self._extra_config,
                         topology=getattr(self.kv_cache_config, "layerwise_cache_topology", None),
                     )
                 if (
                     draft_names
-                    and not self._layerwise_reuse_layout.has_layer_reuse
+                    and (self._layerwise_reuse_layout is None or not self._layerwise_reuse_layout.has_layer_reuse)
                     and not getattr(self.kv_cache_config, "layerwise_draft_layer_names", ())
                     and getattr(self, "_dspark_prefix_keys", None) is None
                 ):
@@ -328,36 +329,32 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                         len(phys_to_layer_idx),
                     )
 
-        self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for _ in range(self.num_layers)]
-        self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for _ in range(self.num_layers)]
-        self.layer_load_finished_events: list[threading.Event] | None = None
-        self.layer_save_finished_events: list[threading.Event] | None = None
-
         self.next_layer_to_submit = 0
         self.layerwise_offload = False
         self.independent_layers: list[int] = []
-        self.prefetch_layer_map: dict[int, int | tuple[int, ...]] = {}
+        self.prefetch_layer_map: dict[int, tuple[int, ...]] = {}
         if self.use_layerwise_transfer or self.use_mooncake_offload:
-            if self._layerwise_reuse_layout is None:
-                cache_layout = build_layerwise_cache_layout(
+            layout = self._layerwise_reuse_layout
+            if layout is None or not layout.has_layer_reuse:
+                cache_layout = LayerwiseCacheConfig.parse(
                     self.num_layers,
                     self._extra_config,
                 )
-                self.layerwise_offload = cache_layout.has_layer_reuse
+                if layout is None and LayerwiseCacheConfig.parse(stage_num_layers, self._extra_config).has_layer_reuse:
+                    raise ValueError("Layerwise offload requires a compiled model reuse plan.")
                 self.independent_layers = cache_layout.independent_layers
-                self.prefetch_layer_map = cache_layout.prefetch_layer_map
                 self.num_prefetch_layers = cache_layout.num_prefetch_layers
             else:
-                layout = self._layerwise_reuse_layout
-                stage_globals = sorted(layout.layer_cache_specs)
+                stage_globals = list(layout.layer_cache_specs)
                 if stage_globals:
+                    self.num_layers = self.layerwise_key_layers = len(stage_globals)
                     self.prefetch_layer_map, self.independent_layers = self._remap_layout_to_stage_local(
                         layout.prefetch_layer_map,
                         layout.independent_layers,
                         stage_globals,
                     )
                 else:
-                    self.prefetch_layer_map = layout.prefetch_layer_map
+                    self.prefetch_layer_map = {layer: reuse_sources(sources) for layer, sources in layout.prefetch_layer_map.items()}
                     self.independent_layers = layout.independent_layers
                 self.layerwise_offload = layout.has_layer_reuse
                 self.num_prefetch_layers = layout.num_prefetch_layers
@@ -368,6 +365,25 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     layer = self._global_to_local_layer.get(self._extract_physical_layer_index(name))
                     if layer is not None and layer not in self.independent_layers:
                         self.independent_layers = [*self.independent_layers, layer]
+                cache_indices = getattr(layout, "cache_layer_indices", None)
+                touched_layers = set(self.prefetch_layer_map) | set(chain.from_iterable(self.prefetch_layer_map.values()))
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                    if cache_indices is not None:
+                        layers = {
+                            self._global_to_local_layer[cache_indices[name]]
+                            for name in group.layer_names
+                            if name in layout.reused_cache_names
+                        }
+                    else:
+                        layers = {
+                            layer for layer in touched_layers
+                            if any(
+                                gid == group_id
+                                for gid, _ in self.physical_layer_to_group_layers.get(layer, [(0, layer)])
+                            )
+                        }
+                    if layers:
+                        self._reused_layers_by_group[group_id] = layers
         else:
             self.num_prefetch_layers = 2
             if self.use_layerwise:
@@ -380,6 +396,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     raise ValueError("layerwise_prefetch_layers must be a positive integer") from exc
                 if self.num_prefetch_layers <= 0:
                     raise ValueError("layerwise_prefetch_layers must be a positive integer")
+        self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for _ in range(self.num_layers)]
+        self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for _ in range(self.num_layers)]
+        self.layer_load_finished_events: list[threading.Event] | None = None
+        self.layer_save_finished_events: list[threading.Event] | None = None
         self.sync_save_events: list[torch.npu.Event] | None = None
 
         logger.info(
@@ -389,22 +409,24 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             {k: v for k, v in list(self.physical_layer_to_group_layers.items())[:3]},
         )
 
+    def _extract_physical_layer_index(self, layer_name: str) -> int:
+        layout = getattr(getattr(self, "kv_cache_config", None), "layerwise_reuse_layout", None)
+        if layout is not None and layer_name in getattr(layout, "cache_layer_indices", {}):
+            return layout.cache_layer_indices[layer_name]
+        return super()._extract_physical_layer_index(layer_name)
+
     @staticmethod
     def _remap_layout_to_stage_local(
-        prefetch_layer_map: dict[int, int | tuple[int, ...]],
+        prefetch_layer_map: dict[int, tuple[int, ...]],
         independent_layers: list[int],
         stage_globals: list[int],
-    ) -> tuple[dict[int, int | tuple[int, ...]], list[int]]:
+    ) -> tuple[dict[int, tuple[int, ...]], list[int]]:
         """Translate a global-indexed reuse layout to stage-local indices."""
         global_to_local = {global_idx: local_idx for local_idx, global_idx in enumerate(stage_globals)}
         return (
             {
-                global_to_local[layer]: (
-                    global_to_local[source]
-                    if isinstance(source, int)
-                    else tuple(global_to_local[item] for item in source)
-                )
-                for layer, source in prefetch_layer_map.items()
+                global_to_local[layer]: tuple(global_to_local[source] for source in reuse_sources(sources))
+                for layer, sources in prefetch_layer_map.items()
             },
             [global_to_local[layer] for layer in independent_layers],
         )
@@ -683,6 +705,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         return
 
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
+        if self._snapshot_keys:
+            for req_id in finished_req_ids | meta.preempted_req_ids:
+                self._snapshot_keys.pop(req_id, None)
         if self._step_load_keys:
             if self.kv_recv_thread is not None:
                 self._drain_attention_transfers(full=True)
@@ -866,6 +891,19 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
 
     def _make_mooncake_layerwise_key(self, block_hash_or_tail: str) -> str:
         return self._make_layerwise_full_key(0, block_hash_or_tail)
+
+    def _layerwise_execution_full_key(self, request: ReqMeta, group_id: int, block_index: int, block_hash: str) -> str:
+        end_token = (block_index + 1) * self.grouped_block_size[group_id]
+        return f"{self._make_layerwise_partial_key(request, group_id, block_index, end_token)}@full@{block_hash}"
+
+    def _uses_execution_full_key(self, request: ReqMeta, group_id: int, block_index: int) -> bool:
+        start = request.layerwise_recompute_start_token
+        return (
+            self.layerwise_offload
+            and not self.group_uses_align_state[group_id]
+            and start is not None
+            and block_index >= start // self.grouped_block_size[group_id]
+        )
 
     def _layerwise_key_batches(self, keys: list[str]) -> list[list[str]]:
         batch_size = self.layerwise_max_transfer_blocks if self.layerwise_max_transfer_blocks > 0 else max(1, len(keys))
@@ -1211,6 +1249,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 save_start_block = max(save_start_block, hit_full_blocks)
             if partial_block_index is None:
                 partial_block_index = request.partial_block_index
+            if self.layerwise_offload and not request.needs_private_snapshot:
+                partial_block_index = None
+                save_end_block = min(save_end_block, len(group_block_hashes))
             num_allocated_blocks = (
                 len(request.block_ids_by_group_np[group_id])
                 if request.block_ids_by_group_np is not None and group_id < len(request.block_ids_by_group_np)
@@ -1269,11 +1310,11 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
     ) -> int:
         """Unhashed full blocks use normal GVA slots; the tail keeps its partial slot."""
         end = request.save_end_token // block_size
-        if self.layerwise_offload and not self.group_uses_align_state[group_id]:
+        if self.use_layerwise_transfer and self.layerwise_offload and not self.group_uses_align_state[group_id]:
             end = request.target_token_len // block_size
             if partial_block_index is not None:
                 end = min(end, partial_block_index)
-        elif self.layerwise_offload:
+        elif self.use_layerwise_transfer and self.layerwise_offload:
             # A group can complete pages before the transfer LCM boundary.
             # Persist those pages before another layer overwrites the slot.
             end = max(
@@ -1285,14 +1326,12 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             )
         return end
 
-    def _pool_keys_missing(self, keys: list[str]) -> set[str]:
+    def _pool_keys_missing(self, keys: list[str], *, fail_open: bool = True) -> set[str]:
         """Return the subset of ``keys`` not yet committed in the pool.
 
         The check is medium-agnostic on purpose: a block committed on any
         medium (DRAM or SSD) does not need re-saving, and the load path
-        rewarms SSD blocks on read. Fails open (treats check errors as
-        missing) so an unreadable pool costs transfer bandwidth, never the
-        blocks themselves.
+        rewarms SSD blocks on read. Public keys require a definite miss.
         """
         if not keys:
             return set()
@@ -1306,14 +1345,17 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                         "MemCache exists check returned unexpected number of states: "
                         f"expected={len(key_batch)}, actual={len(states)}"
                     )
-                missing.update(key for key, state in zip(key_batch, states) if int(state) != 1)
+                missing.update(
+                    key for key, state in zip(key_batch, states) if int(state) == 0 or (fail_open and int(state) != 1)
+                )
             except Exception as exc:
                 logger.error(
-                    "Pool exists check failed keys=%d error=%s; treating all as missing",
+                    "Pool exists check failed keys=%d error=%s",
                     len(key_batch),
                     exc,
                 )
-                missing.update(key_batch)
+                if fail_open:
+                    missing.update(key_batch)
         return missing
 
     def _alloc_gvas_for_save(self, requests: list[ReqMeta]) -> None:
@@ -1321,12 +1363,15 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             return
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             return
+        public_allocated: set[str] = set()
         for request in requests:
             if self._save_disabled.is_set():
                 break
             if not request.can_save:
                 continue
-            if self._alloc_gvas_for_save_for_request([request]) is False:
+            if self.layerwise_offload and (request.load_spec is None or not request.load_spec.layerwise_previous_step):
+                self._snapshot_keys.pop(request.req_id, None)
+            if self._alloc_gvas_for_save_for_request([request], public_allocated=public_allocated) is False:
                 logger.error("Memcache save preparation failed for %s", request.req_id)
                 self._save_disabled.set()
         if self._save_disabled.is_set():
@@ -1335,10 +1380,13 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             for request in requests:
                 if self.layerwise_offload and request.can_save:
                     self._record_failed_request(request)
+                    self._snapshot_keys.pop(request.req_id, None)
                 request.can_save = False
                 request.save_keys = []
 
-    def _alloc_gvas_for_save_for_request(self, requests: list[ReqMeta]) -> bool | None:
+    def _alloc_gvas_for_save_for_request(
+        self, requests: list[ReqMeta], public_allocated: set[str] | None = None
+    ) -> bool | None:
         """Allocate per-group GVA on the worker side right before batch_copy.
 
         For multi-group models, iterates all KV cache groups and allocates
@@ -1355,6 +1403,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             return None
         if not self.can_put:
             return None
+        if public_allocated is None:
+            public_allocated = set()
         for request in requests:
             if request.can_save is None or not request.can_save:
                 continue
@@ -1363,10 +1413,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             all_group_gvas: list[np.ndarray] = []
             all_group_block_ids: list[np.ndarray] = []
             all_group_save_keys: list[str] = []
-            alloc_keys: list[str] = []
-            alloc_sizes: list[int] = []
-            alloc_targets: list[tuple[np.ndarray | list[int], int]] = []
             request.partial_save_gva_per_group = [0] * self.num_kv_cache_groups
+            request.public_save_blocks = {}
             for group_id in range(self.num_kv_cache_groups):
                 block_ids_by_group = (
                     request.block_ids_by_group_np[group_id]
@@ -1375,7 +1423,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 )
                 if block_ids_by_group is None:
                     raise RuntimeError(f"Block IDs are not initialized for request {request.req_id}")
-                if group_id not in self.cacheable_group_ids or not self._is_layerwise_save_owner(group_id):
+                save_owner = self._is_layerwise_save_owner(group_id)
+                keep_snapshot = self.layerwise_offload and request.needs_private_snapshot
+                if group_id not in self.cacheable_group_ids or (not save_owner and not keep_snapshot):
                     all_group_gvas.append(np.zeros(len(block_ids_by_group), dtype=np.int64))
                     all_group_block_ids.append(np.asarray(block_ids_by_group, dtype=np.int64))
                     continue
@@ -1408,27 +1458,65 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     else None
                 )
                 end_limit = min(save_end_block, len(block_ids_by_group))
-                if not (self.layerwise_offload and not self.group_uses_align_state[group_id]):
+                if not (
+                    self.layerwise_offload
+                    and request.needs_private_snapshot
+                    and not self.group_uses_align_state[group_id]
+                ):
                     end_limit = min(end_limit, len(group_block_hashes))
                 candidate_blocks = [
                     block_idx
                     for block_idx in range(save_start_block, end_limit)
                     if group_store_mask is None or block_idx >= len(group_store_mask) or group_store_mask[block_idx]
                 ]
-                candidate_keys = [
-                    self._make_layerwise_full_key(
-                        group_id,
-                        block_hash_to_str(group_block_hashes[block_idx]),
+                candidate_keys: list[str] = []
+                candidate_public_keys: set[str] = set()
+                publication_keys: dict[int, str] = {}
+                for block_idx in candidate_blocks:
+                    if block_idx >= len(group_block_hashes):
+                        key = self._make_layerwise_partial_key(request, group_id, block_idx, request.target_token_len)
+                    else:
+                        block_hash = block_hash_to_str(group_block_hashes[block_idx])
+                        key = self._make_layerwise_full_key(group_id, block_hash)
+                        if keep_snapshot and (
+                            self.group_uses_align_state[group_id]
+                            or self._uses_execution_full_key(request, group_id, block_idx)
+                        ):
+                            publication_keys[block_idx] = key
+                            key = self._layerwise_execution_full_key(request, group_id, block_idx, block_hash)
+                        else:
+                            candidate_public_keys.add(key)
+                    candidate_keys.append(key)
+                partial_key = None
+                if keep_snapshot and partial_block_index is not None and partial_block_index < len(block_ids_by_group):
+                    partial_key = self._make_layerwise_partial_key(
+                        request, group_id, partial_block_index, request.target_token_len
                     )
-                    if block_idx < len(group_block_hashes)
-                    else self._make_layerwise_partial_key(request, group_id, block_idx, request.target_token_len)
-                    for block_idx in candidate_blocks
-                ]
+                if keep_snapshot:
+                    pages = self._snapshot_keys.setdefault(request.req_id, {}).setdefault(group_id, {})
+                    if self.group_uses_align_state[group_id] and (candidate_blocks or partial_key is not None):
+                        pages.clear()
+                    pages.update(
+                        (index, (min((index + 1) * effective_block_size, request.target_token_len), key))
+                        for index, key in zip(candidate_blocks, candidate_keys)
+                    )
+                    if partial_key is not None:
+                        pages[partial_block_index] = (request.target_token_len, partial_key)
+                if not save_owner:
+                    all_group_gvas.append(np.zeros(len(block_ids_by_group), dtype=np.int64))
+                    all_group_block_ids.append(np.asarray(block_ids_by_group, dtype=np.int64))
+                    continue
                 # Skip blocks already committed in the pool. The exists check
                 # is medium-agnostic on purpose: a committed block (DRAM or
                 # SSD) does not need re-saving, and the load path rewarms
                 # SSD blocks on read.
-                missing_keys = self._pool_keys_missing(candidate_keys)
+                if self.layerwise_offload:
+                    private_keys = [key for key in candidate_keys if key not in candidate_public_keys]
+                    missing_keys = self._pool_keys_missing(private_keys)
+                    missing_keys.update(self._pool_keys_missing(list(candidate_public_keys), fail_open=False))
+                else:
+                    missing_keys = self._pool_keys_missing(candidate_keys)
+                missing_keys.difference_update(public_allocated)
                 transfer_blocks = [
                     block_idx for block_idx, key in zip(candidate_blocks, candidate_keys) if key in missing_keys
                 ]
@@ -1437,25 +1525,85 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 # returns its current, client-registered GVA. Every write
                 # target is therefore allocated fresh within this step; no
                 # cross-step GVA cache is kept.
-                full_gvas = np.zeros(len(block_ids_by_group), dtype=np.int64)
+                block_gvas: list[int] = []
                 if transfer_blocks:
                     transfer_keys = [key for key in candidate_keys if key in missing_keys]
-                    alloc_keys.extend(transfer_keys)
-                    alloc_sizes.extend([alloc_size] * len(transfer_keys))
-                    alloc_targets.extend((full_gvas, block_idx) for block_idx in transfer_blocks)
-
-                if partial_block_index is not None and partial_block_index < len(block_ids_by_group):
-                    partial_key = self._make_layerwise_partial_key(
-                        request,
-                        group_id,
-                        partial_block_index,
-                        request.target_token_len,
+                    transfer_gvas = self.m_store.batch_alloc(
+                        transfer_keys, [alloc_size] * len(transfer_keys), LAYERWISE_READ_LEASE_TTL_MS
                     )
-                    # Request-scoped partial pages share the allocation batch,
-                    # but keep their own destination and key namespace.
-                    alloc_keys.append(partial_key)
-                    alloc_sizes.append(alloc_size)
-                    alloc_targets.append((request.partial_save_gva_per_group, group_id))
+                    if transfer_gvas is None or len(transfer_gvas) != len(transfer_keys):
+                        return False
+                    if any(gva <= 0 for gva in transfer_gvas):
+                        logger.error(
+                            "alloc_gvas FAIL: req=%s group=%d alloc_size=%d alloc_keys=%d gvas_sample=%s fail_count=%d",
+                            request.req_id,
+                            group_id,
+                            alloc_size,
+                            len(transfer_keys),
+                            transfer_gvas[:5],
+                            sum(1 for g in transfer_gvas if g <= 0),
+                        )
+                    # 0 means allocation failed; UINT64_MAX means a readable
+                    # SSD hit. Filter both before converting GVAs to np.int64.
+                    block_gvas = [gva if 0 < gva < MEMCACHE_SSD_HIT_GVA else 0 for gva in transfer_gvas]
+                    for key, gva in zip(transfer_keys, block_gvas):
+                        if gva > 0:
+                            all_group_save_keys.append(key)
+                            if key in candidate_public_keys:
+                                public_allocated.add(key)
+                    if self.layerwise_offload and any(gva <= 0 for gva in transfer_gvas):
+                        return False
+
+                # An immutable public key may contain a different execution's
+                # rounding. Keep our exact pages for intra-request restore,
+                # while publishing missing public pages through the same queue.
+                public_blocks = list(publication_keys)
+                public_keys = list(publication_keys.values())
+                missing_public = self._pool_keys_missing(public_keys, fail_open=False) - public_allocated
+                public_blocks = [idx for idx, key in zip(public_blocks, public_keys) if key in missing_public]
+                public_keys = [key for key in public_keys if key in missing_public]
+                if public_blocks:
+                    allocated = self.m_store.batch_alloc(
+                        public_keys, [alloc_size] * len(public_keys), LAYERWISE_READ_LEASE_TTL_MS
+                    )
+                    if (
+                        allocated is None
+                        or len(allocated) != len(public_keys)
+                        or any(not 0 < gva < MEMCACHE_SSD_HIT_GVA for gva in allocated)
+                    ):
+                        return False
+                    request.public_save_blocks[group_id] = (
+                        block_ids_by_group[public_blocks],
+                        np.asarray(allocated, dtype=np.int64),
+                    )
+                    all_group_save_keys.extend(public_keys)
+                    public_allocated.update(public_keys)
+
+                if partial_key is not None:
+                    # Partial keys are request-scoped: allocate fresh each step.
+                    allocated = self.m_store.batch_alloc(
+                        [partial_key],
+                        [alloc_size],
+                        LAYERWISE_READ_LEASE_TTL_MS,
+                    )
+                    if not allocated or len(allocated) != 1:
+                        return False
+                    partial_gva = allocated[0]
+                    if 0 < partial_gva < MEMCACHE_SSD_HIT_GVA:
+                        all_group_save_keys.append(partial_key)
+                    elif partial_gva <= 0:
+                        logger.error(
+                            "alloc_gvas: partial allocation failed req=%s group=%d block=%d gva=%d",
+                            request.req_id,
+                            group_id,
+                            partial_block_index,
+                            partial_gva,
+                        )
+                    if self.layerwise_offload and partial_gva <= 0:
+                        return False
+                    request.partial_save_gva_per_group[group_id] = (
+                        partial_gva if 0 < partial_gva < MEMCACHE_SSD_HIT_GVA else 0
+                    )
 
                 logger.debug(
                     "alloc_gvas: req=%s group=%d eff_bs=%d save_blocks=[%d,%d) "
@@ -1471,29 +1619,14 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     alloc_size,
                 )
 
-                all_group_gvas.append(full_gvas)
-                all_group_block_ids.append(np.asarray(block_ids_by_group, dtype=np.int64))
+                # Pad block_gvas to match block_ids length (fill 0 for non-transferred blocks)
+                full_gvas = [0] * len(block_ids_by_group)
+                for blk_idx, gva in zip(transfer_blocks, block_gvas):
+                    if blk_idx < len(full_gvas):
+                        full_gvas[blk_idx] = gva
 
-            if alloc_keys:
-                # The backend accepts per-key sizes, so all groups and full /
-                # partial pages can use one request-local allocation batch.
-                gvas = self.m_store.batch_alloc(alloc_keys, alloc_sizes, LAYERWISE_READ_LEASE_TTL_MS)
-                if gvas is None or len(gvas) != len(alloc_keys):
-                    return False
-                if any(gva <= 0 for gva in gvas):
-                    logger.error(
-                        "alloc_gvas FAIL: req=%s alloc_keys=%d fail_count=%d",
-                        request.req_id,
-                        len(alloc_keys),
-                        sum(gva <= 0 for gva in gvas),
-                    )
-                    if self.layerwise_offload:
-                        return False
-                for key, gva, (target, index) in zip(alloc_keys, gvas, alloc_targets):
-                    # Filter failure / SSD sentinels before writing np.int64.
-                    if 0 < gva < MEMCACHE_SSD_HIT_GVA:
-                        target[index] = gva
-                        all_group_save_keys.append(key)
+                all_group_gvas.append(np.asarray(full_gvas, dtype=np.int64))
+                all_group_block_ids.append(np.asarray(block_ids_by_group, dtype=np.int64))
 
             if all_group_gvas:
                 request.save_keys = all_group_save_keys
@@ -1608,7 +1741,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             num_blocks = request.save_end_token // self.grouped_block_size[group_id]
             if self.layerwise_offload:
                 num_blocks = self._layerwise_save_full_end(request, group_id, self.grouped_block_size[group_id], None)
-            if self.layerwise_offload and self._group_reuses_buffer(group_id):
+            if self.layerwise_offload and group_id in self._reused_layers_by_group:
                 # Only the running endpoint belongs to this layer after reuse.
                 # Older non-null slots may already hold another layer's state.
                 result[group_id] = [
@@ -1648,6 +1781,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         layer_idx_in_group: int = 0,
     ) -> None:
         block_size = get_group_block_size(self.grouped_block_size, group_id)
+        reuses_buffer = self.layerwise_offload and layer_id in self._reused_layers_by_group.get(group_id, ())
         request_block_ranges = []
         for request in requests:
             if self.use_block_key_layerwise:
@@ -1693,15 +1827,11 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 block_size,
                 self.hash_block_size,
             )
-            load_start_block = (
-                request.load_spec.vllm_cached_tokens // block_size
-                if not self.layerwise_offload or layer_id in self.independent_layers
-                else 0
-            )
+            load_start_block = request.load_spec.vllm_cached_tokens // block_size if not reuses_buffer else 0
             cached_full_blocks = cached_tokens // block_size
             full_blocks = min(cached_full_blocks, len(group_block_hashes))
-            if self._layerwise_load_snapshot_start(request, group_id, cached_tokens) is not None:
-                full_blocks = cached_full_blocks
+            if self.layerwise_offload and request.load_spec.layerwise_previous_step:
+                full_blocks = 0 if self.group_uses_align_state[group_id] else cached_full_blocks
             partial_block_index, _ = self._resolve_layerwise_load_partial(
                 request,
                 group_id,
@@ -1709,7 +1839,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 block_size,
                 len(group_block_hashes),
             )
-            if not self.layerwise_offload or layer_id in self.independent_layers:
+            if not reuses_buffer:
                 partial_block_index = None
             partial_gva = (
                 request.partial_load_gva_per_group[group_id]
@@ -1786,73 +1916,23 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         block_size: int,
         hash_count: int,
     ) -> tuple[int | None, int]:
-        """Resolve the block and key length of a layerwise partial load.
-
-        Speculative rejection may roll ``cached_tokens`` back after the prior
-        step saved a longer request-scoped snapshot.  Reuse that exact saved
-        identity when it still covers the logical prefix. A snapshot can
-        include unhashed full blocks as well as its tail; rollback can land
-        in any of those blocks for attention groups. Recurrent state can
-        only restore its exact saved endpoint; it cannot be rolled back.
-        """
+        """Select the trailing page in the transfer, independently of hash availability."""
+        if (
+            self.layerwise_offload
+            and request.load_spec is not None
+            and request.load_spec.layerwise_previous_step
+            and cached_tokens > 0
+        ):
+            if self.group_uses_align_state[group_id] or cached_tokens % block_size:
+                return (cached_tokens - 1) // block_size, cached_tokens
+            return None, cached_tokens
         partial_block_index = get_partial_block_index(
             cached_tokens,
             block_size,
             hash_count,
             self.layerwise_offload,
         )
-        partial_end_token = cached_tokens
-        load_spec = request.load_spec
-        if load_spec is None:
-            return partial_block_index, partial_end_token
-        if self.layerwise_offload and self.group_uses_align_state[group_id]:
-            # A full recurrent page may have been saved before its hash was
-            # published. Keep that exact request snapshot when hashes arrive.
-            if load_spec.layerwise_previous_step and load_spec.layerwise_snapshot_end_token == cached_tokens:
-                return (cached_tokens - 1) // block_size, cached_tokens
-            return partial_block_index, partial_end_token
-
-        snapshot_end_token = load_spec.layerwise_snapshot_end_token
-        snapshot_start = self._layerwise_load_snapshot_start(request, group_id, cached_tokens)
-        if snapshot_start is None:
-            return partial_block_index, partial_end_token
-
-        assert snapshot_end_token is not None
-        logical_last_block = (cached_tokens - 1) // block_size
-        if snapshot_start <= logical_last_block:
-            logger.debug(
-                "Reqid: %s reusing layerwise snapshot block=%d end_token=%d for logical length=%d",
-                request.req_id,
-                logical_last_block,
-                snapshot_end_token,
-                cached_tokens,
-            )
-            return logical_last_block, snapshot_end_token
-        return partial_block_index, partial_end_token
-
-    def _layerwise_load_snapshot_start(self, request: ReqMeta, group_id: int, cached_tokens: int) -> int | None:
-        """Use the preceding save's key namespace, not this step's hash availability."""
-        spec = request.load_spec
-        if (
-            not self.layerwise_offload
-            or self.group_uses_align_state[group_id]
-            or spec is None
-            or cached_tokens <= 0
-            or spec.layerwise_snapshot_end_token is None
-            or spec.layerwise_snapshot_end_token < cached_tokens
-        ):
-            return None
-        start_block = (
-            spec.layerwise_snapshot_start_block
-            if spec.layerwise_snapshot_start_block is not None
-            else spec.layerwise_snapshot_block_index
-        )
-        if start_block is None:
-            return None
-        # RequestTracker records snapshot blocks in the transfer LCM unit;
-        # each group addresses pages in its own block size.
-        transfer_size = getattr(self, "cache_transfer_granularity", self.grouped_block_size[group_id])
-        return start_block * transfer_size // self.grouped_block_size[group_id]
+        return partial_block_index, cached_tokens
 
     def _prepare_load_gvas(self, requests: list[ReqMeta]) -> None:
         for request in requests:
@@ -1892,6 +1972,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 )
             block_hashes = request.block_hashes
             request.load_masks = self._compute_reachable_load_masks(request, cached_tokens)
+            previous_step = self.layerwise_offload and request.load_spec.layerwise_previous_step
 
             all_group_load_gvas: list[np.ndarray] = []
             all_group_load_keys: list[str] = []
@@ -1900,14 +1981,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 if group_id not in self.cacheable_group_ids:
                     all_group_load_gvas.append(np.zeros(0, dtype=np.int64))
                     continue
-                if (
-                    self.layerwise_offload
-                    and request.load_spec.layerwise_previous_step
-                    and self.group_uses_align_state[group_id]
-                    and not self._group_reuses_buffer(group_id)
-                ):
-                    # Resident recurrent checkpoints are selected by the model
-                    # after speculative acceptance, not restored from snapshots.
+                reused_groups = getattr(self, "_reused_layers_by_group", None)
+                if previous_step and reused_groups is not None and group_id not in reused_groups:
+                    # Resident pages remain available for the running request.
                     all_group_load_gvas.append(np.zeros(0, dtype=np.int64))
                     continue
                 group_block_size = self.grouped_block_size[group_id]
@@ -1919,9 +1995,11 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 )
                 cached_full_blocks = cached_tokens // effective_block_size
                 full_blocks = min(cached_full_blocks, len(group_block_hashes))
-                snapshot_start = self._layerwise_load_snapshot_start(request, group_id, cached_tokens)
-                if snapshot_start is not None:
-                    full_blocks = cached_full_blocks
+                uses_align_state = self.group_uses_align_state[group_id]
+                snapshot = {}
+                if previous_step:
+                    full_blocks = 0 if uses_align_state else cached_full_blocks
+                    snapshot = self._snapshot_keys.get(request.req_id, {}).get(group_id, {})
 
                 block_ids_by_group = (
                     request.block_ids_by_group_np[group_id]
@@ -1929,6 +2007,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     else request.block_ids_np
                 )
                 if block_ids_by_group is None:
+                    if previous_step:
+                        return False
                     all_group_load_gvas.append(np.zeros(0, dtype=np.int64))
                     continue
                 full_len = len(block_ids_by_group)
@@ -1943,6 +2023,8 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 if partial_block_index is not None and (
                     partial_block_index < load_start_block or partial_block_index >= full_len
                 ):
+                    if previous_step:
+                        return False
                     partial_block_index = None
 
                 if load_start_block >= full_blocks and partial_block_index is None:
@@ -1960,16 +2042,6 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     if block_idx != partial_block_index
                     and (group_load_mask is None or block_idx >= len(group_load_mask) or group_load_mask[block_idx])
                 ]
-                keys = []
-                for block_idx in block_indices:
-                    if snapshot_start is None or block_idx < snapshot_start:
-                        key = self._make_layerwise_full_key(group_id, block_hash_to_str(group_block_hashes[block_idx]))
-                    else:
-                        snapshot_end_token = request.load_spec.layerwise_snapshot_end_token
-                        assert snapshot_end_token is not None
-                        key = self._make_layerwise_partial_key(request, group_id, block_idx, snapshot_end_token)
-                    keys.append(key)
-                has_partial_key = False
                 if any(block_idx >= full_len for block_idx in block_indices):
                     logger.error(
                         "Memcache load range exceeds allocated blocks: req=%s group=%d "
@@ -1981,17 +2053,29 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                         full_len,
                     )
                     return False
+                has_partial_key = partial_block_index is not None
                 if partial_block_index is not None:
-                    keys.append(
-                        self._make_layerwise_partial_key(
-                            request,
-                            group_id,
-                            partial_block_index,
-                            partial_end_token,
-                        )
-                    )
                     block_indices.append(partial_block_index)
-                    has_partial_key = True
+                keys = []
+                for block_idx in block_indices:
+                    end = min((block_idx + 1) * effective_block_size, cached_tokens)
+                    saved = snapshot.get(block_idx)
+                    if saved is not None and (saved[0] == end or (not uses_align_state and saved[0] > end)):
+                        keys.append(saved[1])
+                    elif previous_step and (
+                        block_idx >= len(group_block_hashes)
+                        or block_idx == partial_block_index
+                        or self._uses_execution_full_key(request, group_id, block_idx)
+                    ):
+                        logger.error(
+                            "No saved KV page for request %s group %d block %d", request.req_id, group_id, block_idx
+                        )
+                        return False
+                    elif block_idx == partial_block_index:
+                        keys.append(self._make_layerwise_partial_key(request, group_id, block_idx, partial_end_token))
+                    else:
+                        block_hash = block_hash_to_str(group_block_hashes[block_idx])
+                        keys.append(self._make_layerwise_full_key(group_id, block_hash))
                 if not keys:
                     all_group_load_gvas.append(np.zeros(full_len, dtype=np.int64))
                     continue
@@ -2216,7 +2300,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         reused_state_groups = [
             group_id
             for group_id, uses_align in enumerate(self.group_uses_align_state)
-            if self.layerwise_offload and uses_align and self._group_reuses_buffer(group_id)
+            if self.layerwise_offload and uses_align and group_id in self._reused_layers_by_group
         ]
         if not reused_state_groups:
             return masks
@@ -2243,7 +2327,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             num_local = getattr(self, "layerwise_key_layers", 0) or self.num_layers
         else:
             num_local = self.num_layers
-        self._wait_for_final_layer_save(num_local, self.kv_send_thread)
+        self._wait_for_final_layer_save(num_local)
 
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         self._masked_runs_cache.clear()
@@ -2256,7 +2340,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         reused_state_groups = [
             group_id
             for group_id, uses_align in enumerate(self.group_uses_align_state)
-            if self.layerwise_offload and uses_align and self._group_reuses_buffer(group_id)
+            if self.layerwise_offload and uses_align and group_id in self._reused_layers_by_group
         ]
         if reused_state_groups:
             for request in requests:
@@ -2409,13 +2493,12 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         transfer stops overlapping compute. Letting the send thread run a bounded
         number of layers behind the compute stream keeps the ranged puts off the
         critical path, and ordering is preserved because that thread still
-        consumes the queue in submission order. ``save_kv_layer`` waits for the
-        final layer's save at the end of every step, which implies every earlier
-        layer committed, so publication is still complete before the step ends.
+        consumes the queue in submission order. The step fence drains all saves,
+        including earlier PUTs when the final layer has no save task.
 
         ``full`` drains the selected queues to zero, defaulting to both queues
-        for teardown. Step completion passes ``drain_recv=False`` to wait only
-        for outstanding PUTs.
+        for teardown. Step completion drains writers first, then reuse readers
+        before resetting save completion events.
         """
         assert self.layerwise_backend is not None
         if full and drain_recv is None:
@@ -2444,15 +2527,15 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         recv_thread = self.kv_recv_thread
 
         def submit_layer_load(layer_id: int) -> bool:
-            reuse_source = self.prefetch_layer_map.get(layer_id)
-            if not self.layer_load_tasks[layer_id] and reuse_source is None:
+            reuse_sources = self.prefetch_layer_map.get(layer_id, ())
+            if not self.layer_load_tasks[layer_id] and not reuse_sources:
                 return False
             attention_start_gate = None
             if self.layer_load_tasks[layer_id] and layer_id != self.current_layer:
                 attention_start_gate = get_attention_compute_start_gate()
             recv_thread.add_request(
                 LayerLoadTask(  # type: ignore[arg-type]
-                    wait_for_save_layer=reuse_source,
+                    wait_for_save_layers=reuse_sources,
                     transfer_tasks=self.layer_load_tasks[layer_id],
                     layer_id=layer_id,
                     attention_start_gate=attention_start_gate,
@@ -2577,12 +2660,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         if self.current_layer == num_local - 1:
             # Recurrent state may be cleared or copied before the next load
             # hook. Finish reading shared state before returning from forward.
-            if _LW_DEFER_LAST_SAVE and not (
-                self._recurrent_layers
-                & (
-                    self.prefetch_layer_map.keys()
-                    | {source for value in self.prefetch_layer_map.values() for source in reuse_sources(value)}
-                )
+            if (
+                _LW_DEFER_LAST_SAVE
+                and self._recurrent_layers.isdisjoint(self.prefetch_layer_map)
+                and self._recurrent_layers.isdisjoint(chain.from_iterable(self.prefetch_layer_map.values()))
             ):
                 # PERF-TUNE(2): move the last layer's save drain off the forward
                 # critical path. The drain (host wait + event reset) runs at the
@@ -2590,48 +2671,24 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 # thread's tail latency into the inter-step scheduling gap.
                 self._pending_last_save_drain = True
             else:
-                self._wait_for_final_layer_save(num_local, send_thread)
+                self._wait_for_final_layer_save(num_local)
         self.current_layer += 1
 
-    def _wait_for_final_layer_save(self, num_local: int, send_thread: KVTransferThread) -> None:
-        """Keep layerwise source buffers alive until the step's last PUT commits."""
+    def _wait_for_final_layer_save(self, num_local: int) -> None:
+        """Drain step transfers before rearming save completion for the next step."""
         assert self.layer_save_finished_events is not None
         save_finished_events = self.layer_save_finished_events
-        # The final layer may have no save task while earlier layers still copy.
-        # Drain pending saves before clearing or reusing completion events.
-        queue = send_thread.request_queue
-        with queue.all_tasks_done:
-            waited_s = 0
-            while queue.unfinished_tasks:
-                send_thread.raise_if_failed()
-                queue.all_tasks_done.wait(timeout=1)
-                waited_s += 1
-                if waited_s % 60 == 0:
-                    logger.info("Layerwise save drain still waiting on %d queued PUT(s)", queue.unfinished_tasks)
-        while not save_finished_events[num_local - 1].wait(timeout=10):
-            send_thread.raise_if_failed()
-            logger.info("Layerwise %d save not done, keep waiting", num_local - 1)
-        send_thread.raise_if_failed()
+        # Keep save completion latched for every reader in this step. Drain
+        # writers first so their failures cannot strand receivers waiting on them.
+        self._drain_attention_transfers(drain_recv=False, full=True)
         if getattr(self, "layerwise_offload", False):
             self._check_layerwise_transfer_errors()
-        if self.block_key_hybrid:
-            # An empty final layer signals completion without waiting for PUTs
-            # from earlier layers. Drain those before the next step reuses KV.
-            self._drain_attention_transfers(drain_recv=False, full=True)
-        elif self.use_block_key_layerwise and not self.layerwise_offload:
-            # An empty final layer sets its event on the compute thread, ahead
-            # of earlier queued PUTs. Drain at the step boundary before source
-            # blocks can be reused. Layer-to-layer overlap remains unchanged.
-            for layer_id in range(num_local - 1):
-                while not save_finished_events[layer_id].wait(timeout=10):
-                    send_thread.raise_if_failed()
-            send_thread.raise_if_failed()
-        reuse_source_layers = {source for value in self.prefetch_layer_map.values() for source in reuse_sources(value)}
-        for layer_id in range(num_local):
-            if layer_id in reuse_source_layers:
-                continue
-            if save_finished_events[layer_id].is_set():
-                save_finished_events[layer_id].clear()
+        if self.prefetch_layer_map:
+            # Even a task with no data can still be waiting on a reuse save.
+            # All readers must finish before the next step rearms these events.
+            self._drain_attention_transfers(full=True)
+        for event in save_finished_events[:num_local]:
+            event.clear()
 
     def retrieve_layer(
         self,

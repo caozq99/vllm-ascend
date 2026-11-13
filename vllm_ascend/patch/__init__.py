@@ -337,10 +337,16 @@
 #       accounting.
 #    How:
 #       Both supported versions select AscendKVCacheConfigBuilder through
-#       NPUPlatform. Its default materialization delegates to the patched
-#       planning functions.
+#       NPUPlatform. Its inherited materialization calls the patched planning
+#       function, which applies offload after native placement. The builder
+#       probes that placement for device cost. Offload admission uses Core's
+#       group-lifetime calculation with that cost; ordinary layouts retain
+#       their native admission paths.
 #    Related PR:
 #       https://github.com/vllm-project/vllm/pull/53558
+#    Future Plan:
+#       Remove the remaining native placement/admission patches when upstream
+#       supports those Ascend layouts.
 #   2. `vllm.v1.core.kv_cache_planning.get_kv_cache_config_from_groups`
 #      `vllm.v1.core.kv_cache_planning._pool_bytes_per_block`
 #    Why:

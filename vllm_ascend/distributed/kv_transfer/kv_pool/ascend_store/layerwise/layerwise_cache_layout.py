@@ -17,12 +17,24 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, is_prefix_cacheable
+from vllm_ascend.core.kv_cache_interface import (
+    AscendSFAIndexerCacheSpec,
+    is_prefix_cacheable,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     get_backend_class,
 )
 from vllm_ascend.utils import get_kv_cache_tensor_layers
+
+from .cache_views import (
+    LayerwiseCacheConfig as LayerwiseCacheConfig,  # public Core probe config
+)
+from .cache_views import (
+    allocate_cache_backing as allocate_cache_backing,
+)
+from .cache_views import (
+    get_cache_views as get_cache_views,
+)
 
 _NUM_SHARED_BUFFERS = "layerwise_num_shared_buffers"
 _PREFETCH_LAYERS = "layerwise_prefetch_layers"
@@ -471,6 +483,14 @@ def apply_layerwise_kv_cache_plan(
     excluded_layer_names: set[str] | None = None,
 ) -> None:
     """Rewrite logical layer tensors to use shared physical KV buffers."""
+    from .cache_planner import apply_layerwise_kv_cache_plan as apply_registered_plan
+    from .cache_planner import get_spec_reuse_rules
+
+    # Keep the generic Mooncake path for unregistered models, but ensure
+    # registered GLM/Qwen runners consume the Core byte-window plan unchanged.
+    if get_spec_reuse_rules(vllm_config) is not None:
+        apply_registered_plan(kv_cache_config, vllm_config, excluded_layer_names=excluded_layer_names)
+        return
     if getattr(kv_cache_config, "layerwise_kv_cache_reuse", False):
         # The capacity builder may already have produced the final physical
         # descriptors. The runner must consume that same plan unchanged.

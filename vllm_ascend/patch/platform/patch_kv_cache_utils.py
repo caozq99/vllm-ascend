@@ -22,7 +22,14 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
 )
-
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.cache_planner import (
+    apply_layerwise_kv_cache_plan,
+    get_layerwise_reuse_config,
+    get_spec_reuse_rules,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
+    LayerwiseCacheConfig,
+)
 from vllm_ascend.models.deepseek_v41.cache_config import (
     get_deepseek_v41_kv_cache_config,
     get_deepseek_v41_pool_bytes_per_block,
@@ -38,7 +45,9 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_pool_bytes_per_block,
 )
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
-from vllm_ascend.models.kimi_k3.cache_config import _get_kimi_k3_dspark_mixed_kv_cache_groups
+from vllm_ascend.models.kimi_k3.cache_config import (
+    _get_kimi_k3_dspark_mixed_kv_cache_groups,
+)
 from vllm_ascend.models.kimi_k3.paired_sfa_cache import (
     paired_sfa_cache_config,
     paired_sfa_cache_groups,
@@ -503,6 +512,13 @@ def _ascend_max_memory_usage_bytes_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
 ) -> int:
     """Keep Ascend admission accounting with the upstream builder API."""
+    extra_config = get_layerwise_reuse_config(getattr(vllm_config, "kv_transfer_config", None))
+    if extra_config is not None and kv_cache_groups and get_spec_reuse_rules(vllm_config) is not None:
+        num_layers = vllm_config.model_config.get_total_num_hidden_layers()
+        if LayerwiseCacheConfig.has_layer_reuse_for_stage(num_layers, extra_config):
+            probe = builder.get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, num_blocks=1)
+            if getattr(probe, "layerwise_kv_cache_reuse", False):
+                return _orig_max_memory_usage_bytes_from_groups(builder, vllm_config, kv_cache_groups)
     if vllm_config.model_config.hf_config.model_type == "kimi_k31":
         return paired_sfa_max_memory(vllm_config, kv_cache_groups)
     if tq_cache.uses_turboquant_groups(kv_cache_groups):
@@ -560,6 +576,13 @@ def _ascend_get_kv_cache_config_from_groups(
     ``copy.deepcopy`` in ``generate_scheduler_kv_cache_config`` and is
     dropped by worker pickle IPC, which never reads it.
     """
+    extra_config = get_layerwise_reuse_config(getattr(vllm_config, "kv_transfer_config", None))
+    offload_requested = False
+    if extra_config is not None and kv_cache_groups and get_spec_reuse_rules(vllm_config) is not None:
+        num_layers = vllm_config.model_config.get_total_num_hidden_layers()
+        offload_requested = LayerwiseCacheConfig.has_layer_reuse_for_stage(num_layers, extra_config)
+    if offload_requested and available_memory < 0:
+        raise ValueError("available_memory must be non-negative")
     qwen_config = (
         None
         if vllm_version_is("0.28.0")
@@ -613,11 +636,16 @@ def _ascend_get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
             prefix_cache_retention_interval=vllm_config.cache_config.prefix_cache_retention_interval,
         )
+        kv_cache_config.native_allocation_ids = (0,) * len(kv_cache_tensors)
     kv_cache_config.kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is not None and speculative_config.method == "dspark":
-        from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import resident_mla_context_group_ids
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_layout import draft_only_group_ids
+        from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
+            resident_mla_context_group_ids,
+        )
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.dspark_prefix_layout import (
+            draft_only_group_ids,
+        )
 
         # Upstream scheduler conversion keeps only the first spec in a uniform
         # group, losing both residency and per-layer is_draft ownership. Keep
@@ -626,6 +654,9 @@ def _ascend_get_kv_cache_config_from_groups(
         # Remove these snapshots once upstream preserves per-layer ownership.
         kv_cache_config.dspark_context_group_ids = resident_mla_context_group_ids(kv_cache_config.kv_cache_groups)
         kv_cache_config.dspark_draft_only_group_ids = draft_only_group_ids(kv_cache_config.kv_cache_groups)
+    if offload_requested and kv_cache_config.num_blocks > 0 and kv_cache_config.kv_cache_tensors:
+        native_bytes = _ascend_pool_bytes_per_block(vllm_config, kv_cache_groups) * kv_cache_config.num_blocks
+        apply_layerwise_kv_cache_plan(kv_cache_config, vllm_config, native_backing_bytes=native_bytes)
     return kv_cache_config
 
 

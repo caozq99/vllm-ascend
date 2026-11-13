@@ -7,29 +7,45 @@ from math import lcm
 from types import MappingProxyType
 from typing import Any
 
+import torch
 from vllm.config import VllmConfig
 from vllm.distributed.utils import get_pp_indices
 from vllm.logger import logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
-from vllm.utils.math_utils import round_up
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec, KVCacheTensor, MambaSpec
-
+from vllm.utils.torch_utils import get_dtype_size
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    KVCacheTensor,
+    MambaSpec,
+)
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
+    get_backend_class,
+)
 
 from .cache_views import (
     LayerwiseCacheConfig,
     LayerwiseReuseLayout,
     SpecReuseRules,
-    cache_view_alignment,
     get_cache_views,
 )
-from .layerwise_cache_layout import get_layerwise_kv_cache_specs, get_physical_layer_index
+from .layerwise_cache_layout import (
+    get_layerwise_kv_cache_specs,
+    get_physical_layer_index,
+)
 
 SPEC_REUSE_RULES = MappingProxyType(
-    dict.fromkeys(
-        ("glm5_next", "glm5_next_text", "glm_moe_dsa"),
-        "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES",
-    )
+    {
+        **dict.fromkeys(
+            ("glm5_next", "glm5_next_text", "glm_moe_dsa"),
+            "vllm_ascend.models.glm5next.cache_reuse.GLM5_NEXT_SPEC_REUSE_RULES",
+        ),
+        **dict.fromkeys(
+            ("qwen4_exp", "qwen4_exp_text"),
+            "vllm_ascend.models.qwen4_exp.cache_reuse.QWEN4_EXP_SPEC_REUSE_RULES",
+        ),
+    }
 )
 
 
@@ -37,13 +53,19 @@ def get_spec_reuse_rules(vllm_config: VllmConfig) -> SpecReuseRules | None:
     text_config = getattr(vllm_config.model_config, "hf_text_config", None) or getattr(
         vllm_config.model_config, "hf_config", None
     )
-    path = SPEC_REUSE_RULES.get(getattr(text_config, "model_type", ""))
+    path = SPEC_REUSE_RULES.get(getattr(text_config, "model_type", None))
     return resolve_obj_by_qualname(path) if path is not None else None
 
 
-def get_layerwise_offload_config(kv_transfer_config: Any) -> dict[str, Any] | None:
-    from .layerwise_cache_layout import get_layerwise_reuse_config
+def get_layerwise_reuse_config(kv_transfer_config: Any) -> dict[str, Any] | None:
+    """Use one transport gate for both GVA reuse and producer-only Mooncake."""
+    from .layerwise_cache_layout import get_layerwise_reuse_config as get_config
 
+    return get_config(kv_transfer_config)
+
+
+# Existing Mooncake call sites use this name for the same opt-in policy.
+def get_layerwise_offload_config(kv_transfer_config: Any) -> dict[str, Any] | None:
     return get_layerwise_reuse_config(kv_transfer_config)
 
 
@@ -65,157 +87,206 @@ class LayerwiseCachePlanner:
         excluded_layer_names: set[str] | None = None,
         *,
         spec_reuse_rules: SpecReuseRules,
+        native_backing_bytes: int | None = None,
     ) -> None:
         self.config = config
         self.vllm_config = vllm_config
         self.extra_config = extra_config
         self.spec_reuse_rules = spec_reuse_rules
+        self.native_backing_bytes = native_backing_bytes
         self.specs = get_layerwise_kv_cache_specs(config)
         self.group_ids = {
             name: index for index, group in enumerate(config.kv_cache_groups) for name in group.layer_names
+        }
+        self.transfer_groups = {
+            i for i, group in enumerate(config.kv_cache_groups) if getattr(group, "enable_kv_transfer", True)
         }
         topology = getattr(config, "layerwise_cache_topology", None)
         if topology is not None and dict(topology.group_ids) != self.group_ids:
             raise ValueError("Layerwise cache topology does not match the native cache groups")
         get_total = getattr(vllm_config.model_config, "get_total_num_hidden_layers", None)
-        self.total_layers = (
+        base_layers = (
             get_total() if callable(get_total) else vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         )
-        self.layer_indices = {name: get_physical_layer_index(name, self.total_layers) for name in self.specs}
-        dspark_draft_names = set(getattr(config, "dspark_draft_layer_names", ()))
+        self.total_layers = base_layers
+        self.layer_indices = {name: get_physical_layer_index(name, base_layers) for name in self.specs}
+        registered = set(getattr(config, "dspark_draft_layer_names", ()))
         self.draft_names = {
             name
             for name, spec in self.specs.items()
-            if name in dspark_draft_names
-            or getattr(spec, "is_draft", False)
-            or self.layer_indices[name] >= self.total_layers
+            if name in registered or getattr(spec, "is_draft", False) or self.layer_indices[name] >= base_layers
         }
         self.layers = tuple(
             sorted({index for name, index in self.layer_indices.items() if name not in self.draft_names})
         )
-        resident_names = set(getattr(getattr(config, "layerwise_cache_topology", None), "resident_layer_names", ()))
+        resident = set(getattr(topology, "resident_layer_names", ()))
         self.excluded_layer_names = (
-            self.draft_names | resident_names | (frozenset(excluded_layer_names or ()) & self.specs.keys())
+            self.draft_names | resident | (frozenset(excluded_layer_names or ()) & self.specs.keys())
         )
+
+    def _alignment(self, packs: list[tuple[str, ...]]) -> int:
+        """Return the element alignment of the packs' data and scale components."""
+        dtypes = []
+        for pack in packs:
+            for name in pack:
+                spec = self.specs[name]
+                dtypes.extend(getattr(spec, "dtypes", (getattr(spec, "dtype", torch.uint8),)))
+                if getattr(spec, "scale_dim", 0):
+                    dtypes.append(spec.scale_dtype)
+        return lcm(*(get_dtype_size(dtype) for dtype in dtypes))
 
     def build(self) -> LayerwiseReuseLayout:
         indices, layers = self.layer_indices, self.layers
         settings = LayerwiseCacheConfig.parse(self.total_layers, self.extra_config, stage_layers=layers)
         independent = settings.independent_layers
-        num_shared_buffers = settings.num_shared_buffers or 0
-        native_cache_tensors = self.config.kv_cache_tensors
-        num_blocks = self.config.num_blocks
-        reusable_entries_by_stride: dict[int, list[str]] = defaultdict(list)
-        cache_view_sizes: dict[str, int] = {}
-        slot_layouts: list[tuple[int, int, list[str]]] = []
-        backing_bytes = 0
-        reusable_entry_names = set()
-        if num_shared_buffers:
-            reusable_entry_names = {
-                entry_name
-                for group in self.config.kv_cache_groups
-                if is_prefix_cacheable(group.kv_cache_spec)
-                for entry_name in group.layer_names
-                if entry_name not in self.excluded_layer_names
-                and indices[entry_name] not in independent
-                and self.can_reuse_spec(self.specs[entry_name], self.spec_reuse_rules)
+        tensors = self.config.kv_cache_tensors
+        buckets, aliases = defaultdict(list), defaultdict(list)
+        regions = {}
+        members = set()
+        views = {}
+        # 1. Bucket layer names by block stride, independent of native slots.
+        if settings.has_layer_reuse:
+            members = {
+                name
+                for name, spec in self.specs.items()
+                if name not in self.excluded_layer_names
+                and indices[name] not in independent
+                and self.group_ids[name] in self.transfer_groups
+                and is_prefix_cacheable(spec)
+                and self.can_reuse_spec(spec, self.spec_reuse_rules)
             }
-        if reusable_entry_names:
-            native_cache_views = get_cache_views(self.config, self.specs)
-            cache_view_sizes = {
-                entry_name: view_end - view_start
-                for entry_name, (_, view_start, view_end) in native_cache_views.items()
-            }
-            resident_slots_by_stride: dict[int, list[list[str]]] = defaultdict(list)
-            for entry_name, (tensor_index, _, _) in native_cache_views.items():
-                block_stride = native_cache_tensors[tensor_index].block_stride
-                if entry_name in reusable_entry_names:
-                    reusable_entries_by_stride[block_stride].append(entry_name)
+            views = get_cache_views(self.config, self.specs)
+            backings = defaultdict(list)
+            allocation_ids = getattr(self.config, "native_allocation_ids", range(len(tensors)))
+            bucket_ids = {}
+            for name, (index, start, end) in views.items():
+                stride = tensors[index].block_stride
+                bucket_ids[name] = stride
+                buckets[stride].append(name)
+                if name in members:
+                    regions[name] = (0, end - start)
+                else:
+                    backings[allocation_ids[index]].append(name)
+            # Preserve overlaps only between resident views. Reusable views
+            # are relocated to their pack origin.
+            for names in backings.values():
+                units, unit, end = [], [], -1
+                for name in sorted(names, key=lambda name: views[name][1:]):
+                    if unit and views[name][1] >= end:
+                        units.append(unit)
+                        unit = []
+                    unit.append(name)
+                    end = max(end, views[name][2])
+                units.append(unit)
+                for unit in units:
+                    start = views[unit[0]][1]
+                    stride = bucket_ids[unit[0]]
+                    if any(bucket_ids[name] != stride for name in unit):
+                        # A shared interval with incompatible page strides cannot be relocated.
+                        break
+                    size = max(views[name][2] for name in unit) - start
+                    aliases[stride].append(unit)
+                    for name in unit:
+                        regions[name] = (views[name][1] - start, size)
+                else:
                     continue
-                # Different groups own disjoint block IDs in the device pool.
-                # Give each resident of the same group a separate fixed slot.
-                group_id = self.group_ids[entry_name]
-                slots_for_stride = resident_slots_by_stride[block_stride]
-                for slot_entry_names in slots_for_stride:
-                    if all(self.group_ids[member_name] != group_id for member_name in slot_entry_names):
-                        slot_entry_names.append(entry_name)
-                        break
-                else:
-                    slots_for_stride.append([entry_name])
-            for block_stride, slots_for_stride in resident_slots_by_stride.items():
-                for slot_entry_names in slots_for_stride:
-                    dtype_alignment = lcm(
-                        *(cache_view_alignment(self.specs[entry_name]) for entry_name in slot_entry_names)
-                    )
-                    slot_offset = round_up(backing_bytes, dtype_alignment)
-                    slot_layouts.append((slot_offset, block_stride, slot_entry_names))
-                    slot_size = max(cache_view_sizes[entry_name] for entry_name in slot_entry_names)
-                    backing_bytes = slot_offset + slot_size
+                buckets.clear()
+                break
+        # Buckets occupy disjoint regions in one device backing. Resident
+        # packs reserve private bytes in that backing.
+        candidate = [tensor for tensor in tensors if tensor.host_resident]
         dependencies = defaultdict(set)
-        reused_names: set[str] = set()
-        for block_stride, bucket_entries in reusable_entries_by_stride.items():
-            # A repeated group starts a new pack, including at the same layer.
-            pack: dict[int, tuple[int, str]] = {}
-            packs: list[dict[int, tuple[int, str]]] = []
-            for entry_name in sorted(
-                bucket_entries, key=lambda entry_name: (indices[entry_name], self.group_ids[entry_name], entry_name)
-            ):
-                group_id = self.group_ids[entry_name]
-                if group_id in pack:
-                    packs.append(pack)
-                    pack = {}
-                pack[group_id] = (indices[entry_name], entry_name)
+        reused_names = set()
+        capacity = 0
+        for stride, names in buckets.items():
+            # 2. Greedily take the longest layer-ordered run without a repeated
+            # group. A repeated group starts the next pack, including at the
+            # same physical layer; groups are never inferred from spec types.
+            packs, pack, groups = [], [], set()
+            for name in sorted(names, key=lambda name: (indices[name], self.group_ids[name], name)):
+                if name not in members:
+                    continue
+                group = self.group_ids[name]
+                if group in groups:
+                    packs.append(tuple(pack))
+                    pack, groups = [], set()
+                pack.append(name)
+                groups.add(group)
             if pack:
-                packs.append(pack)
-            dtype_alignment = lcm(*(cache_view_alignment(self.specs[entry_name]) for entry_name in bucket_entries))
-            buffer_size = num_blocks * block_stride
-            entries_by_slot: dict[int, list[str]] = {}
-            slot_last_entries: dict[int, dict[int, tuple[int, str]]] = {}
-            next_slot = 0
-            slot_count = num_shared_buffers
+                packs.append(tuple(pack))
+            packs.extend(tuple(unit) for unit in aliases[stride])
+            packs.sort(key=lambda pack: min(indices[name] for name in pack))
+            descriptors, cursor = {}, 0
+            dtype_alignment = self._alignment(packs)
+            # Align in per-block units so probing one block gives exactly the
+            # same cost as planning the final number of blocks.
+            alignment = self.config.num_blocks * dtype_alignment
+            capacity = (capacity + alignment - 1) // alignment * alignment
+            buffer_size = self.config.num_blocks * stride
+            buffers, previous, slot = {}, {}, 0
+            slot_count = settings.num_shared_buffers
             for pack in packs:
-                for distance in range(slot_count):
-                    slot_index = (next_slot + distance) % slot_count
-                    last_entry_by_group = slot_last_entries.get(slot_index, {})
-                    # Same-layer entries in a group use the same block addresses.
-                    if not any(
-                        layer == last_entry_by_group[group_id][0]
-                        for group_id, (layer, _) in pack.items()
-                        if group_id in last_entry_by_group
-                    ):
-                        break
+                # 3. Rotate complete packs, growing the ring only when every
+                # slot conflicts. Resident packs have private regions.
+                group_layers = {(self.group_ids[name], indices[name]) for name in pack}
+                size = max(regions[name][1] for name in pack)
+                selected_slot = None
+                if size <= buffer_size and all(name in members for name in pack):
+                    for distance in range(slot_count):
+                        candidate_slot = (slot + distance) % slot_count
+                        if all(
+                            layer > previous.get((candidate_slot, group), (-1, ()))[0] for group, layer in group_layers
+                        ):
+                            selected_slot = candidate_slot
+                            break
+                    else:
+                        selected_slot = slot_count
+                        slot_count += 1
+                if selected_slot is not None and selected_slot in buffers:
+                    offset = buffers[selected_slot]
                 else:
-                    slot_index = slot_count
-                    slot_count += 1
-                reusable_slot_entries = entries_by_slot.get(slot_index)
-                if reusable_slot_entries is None:
-                    slot_offset = round_up(backing_bytes, dtype_alignment)
-                    reusable_slot_entries = entries_by_slot[slot_index] = []
-                    slot_layouts.append((slot_offset, block_stride, reusable_slot_entries))
-                    backing_bytes = slot_offset + buffer_size
-                last_entry_by_group = slot_last_entries.setdefault(slot_index, {})
-                for group_id, (layer, entry_name) in pack.items():
-                    reusable_slot_entries.append(entry_name)
-                    previous_entry = last_entry_by_group.get(group_id)
-                    if previous_entry is not None:
-                        source_layer, source_entry_name = previous_entry
-                        dependencies[layer].add(source_layer)
-                        reused_names.update((source_entry_name, entry_name))
-                    last_entry_by_group[group_id] = (layer, entry_name)
-                next_slot = (slot_index + 1) % slot_count
-        kv_cache_tensors: tuple[KVCacheTensor, ...] = ()
-        if dependencies:
-            kv_cache_tensors = tuple(
-                KVCacheTensor(
-                    size=backing_bytes, layers=entry_names, layer_stride=0, block_stride=block_stride, offset=offset
-                )
-                for offset, block_stride, entry_names in slot_layouts
-            )
+                    offset = (cursor + alignment - 1) // alignment * alignment
+                    cursor = offset + (buffer_size if selected_slot is not None else size)
+                    if selected_slot is not None:
+                        buffers[selected_slot] = offset
+                group_names = defaultdict(set)
+                for name in pack:
+                    block_stride = tensors[views[name][0]].block_stride
+                    cache_offset = offset + regions[name][0]
+                    key = (cache_offset, block_stride)
+                    if key not in descriptors:
+                        descriptors[key] = KVCacheTensor(
+                            size=0,
+                            layers=[],
+                            layer_stride=0,
+                            block_stride=block_stride,
+                            offset=capacity + cache_offset,
+                        )
+                    descriptors[key].layers.append(name)
+                    group_names[self.group_ids[name]].add(name)
+                if selected_slot is not None:
+                    for group, layer in group_layers:
+                        key = (selected_slot, group)
+                        if key in previous:
+                            source, names = previous[key]
+                            dependencies[layer].add(source)
+                            reused_names.update(names | group_names[group])
+                        previous[key] = (layer, group_names[group])
+                    slot = (selected_slot + 1) % slot_count
+            capacity += cursor
+            candidate.extend(descriptors.values())
+        for tensor in candidate:
+            if not tensor.host_resident:
+                tensor.size = capacity
+        if not dependencies or (self.native_backing_bytes is not None and capacity >= self.native_backing_bytes):
+            candidate = tensors
+            dependencies.clear()
+            reused_names.clear()
         return LayerwiseReuseLayout(
-            layers=layers,
+            layers=tuple(layers),
             cache_layer_indices=indices,
-            kv_cache_tensors=kv_cache_tensors,
-            cache_view_sizes=cache_view_sizes,
+            kv_cache_tensors=tuple(candidate),
+            cache_view_sizes={name: end - start for name, (_, start, end) in views.items()},
             prefetch_layer_map={layer: tuple(sorted(sources)) for layer, sources in dependencies.items()},
             independent_layers=independent,
             num_prefetch_layers=settings.num_prefetch_layers,
@@ -237,10 +308,21 @@ class LayerwiseCachePlanner:
                 raise ValueError(
                     "Layerwise offload does not support num_gpu_blocks_override; use automatic block sizing."
                 )
-            if any(tensor.host_resident for tensor in self.config.kv_cache_tensors) or any(
+            if any(t.host_resident for t in self.config.kv_cache_tensors) or any(
                 getattr(spec, "store_on_host", False) for spec in self.specs.values()
             ):
                 raise ValueError("Layerwise offload requires device-resident cache tensors.")
+            parallel = getattr(self.vllm_config, "parallel_config", None)
+            backend = get_backend_class(str(self.extra_config.get("backend", "mooncake")))
+            # Mooncake's GLM topology already describes PCP-local native pages.
+            # Do not extend that capability to Qwen/GVA layouts implicitly.
+            pcp_supported = (
+                getattr(self.config, "layerwise_cache_topology", None) is not None
+                and backend is not None
+                and backend.layerwise_data_plane == "block_key"
+            )
+            if getattr(parallel, "prefill_context_parallel_size", 1) > 1 and not pcp_supported:
+                raise NotImplementedError("Layerwise offload does not support prefill context parallelism.")
             logger.info(
                 "Layerwise reuse uses one %d-byte device backing; independent layers=%s.",
                 next(tensor.size for tensor in layout.kv_cache_tensors if not tensor.host_resident),
@@ -249,6 +331,8 @@ class LayerwiseCachePlanner:
             self.config.kv_cache_tensors = list(layout.kv_cache_tensors)
             self.config.layerwise_kv_cache_reuse = True
         self.config.layerwise_reuse_layout = layout
+        # Store must validate reusable prefixes, and allocation must use exactly
+        # the same single backing and byte windows as the physical planner.
         self.config.layerwise_component_plan = layout.has_layer_reuse
         self.config.layerwise_store_verified_prefix = layout.has_layer_reuse
         if layout.has_layer_reuse and self.draft_names:
@@ -260,8 +344,9 @@ def apply_layerwise_kv_cache_plan(
     vllm_config: VllmConfig,
     *,
     excluded_layer_names: set[str] | None = None,
+    native_backing_bytes: int | None = None,
 ) -> None:
-    """Apply registered component reuse when the model and stage request it."""
+    """Plan whole-pack reuse for models with registered rules."""
     layout = getattr(kv_cache_config, "layerwise_reuse_layout", None)
     if layout is not None:
         if excluded_layer_names and layout.reused_cache_names.intersection(excluded_layer_names):
@@ -270,31 +355,31 @@ def apply_layerwise_kv_cache_plan(
     # An empty device pool has no byte views to reuse.
     if not kv_cache_config.kv_cache_tensors or kv_cache_config.num_blocks == 0 or not kv_cache_config.kv_cache_groups:
         return
-    extra_config = get_layerwise_offload_config(getattr(vllm_config, "kv_transfer_config", None))
+    extra_config = get_layerwise_reuse_config(getattr(vllm_config, "kv_transfer_config", None))
     if extra_config is None:
         return
     rules = get_spec_reuse_rules(vllm_config)
     if rules is None:
         return
-    model_config = vllm_config.model_config
     planner = LayerwiseCachePlanner(
         kv_cache_config,
         vllm_config,
         extra_config,
         excluded_layer_names,
         spec_reuse_rules=rules,
+        native_backing_bytes=native_backing_bytes,
     )
-    parallel_config = vllm_config.parallel_config
-    pp_size = getattr(parallel_config, "pipeline_parallel_size", 1)
+    parallel = vllm_config.parallel_config
+    pp_size = getattr(parallel, "pipeline_parallel_size", 1)
     if pp_size > 1:
-        # Core plans every worker's groups with the same parallel config.
         complete_stage = any(
             planner.layers == tuple(range(*get_pp_indices(planner.total_layers, rank, pp_size)))
             for rank in range(pp_size)
         )
     else:
-        complete_stage = len(planner.layers) >= model_config.get_num_layers(parallel_config)
+        complete_stage = len(planner.layers) >= vllm_config.model_config.get_num_layers(parallel)
     if not complete_stage:
-        # The hook cursor requires the complete local set of cache-bearing layers.
+        # Hook cursors require every local physical layer; a partial probe is
+        # not permission to reuse buffers across omitted layers.
         planner.extra_config = {**extra_config, "layerwise_independent_layers": "all"}
     planner.apply()

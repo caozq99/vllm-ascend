@@ -29,11 +29,16 @@ from unittest.mock import patch
 import torch
 import torch.nn as nn
 import torch_npu
+import vllm_ascend.envs as envs_ascend
 from torch_npu.op_plugin.atb._atb_ops import _register_atb_extensions
 from torch_npu.profiler import dynamic_profile as dp
 from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
-from vllm.distributed import ensure_model_parallel_initialized, get_pcp_group, init_distributed_environment
+from vllm.distributed import (
+    ensure_model_parallel_initialized,
+    get_pcp_group,
+    init_distributed_environment,
+)
 from vllm.distributed.ec_transfer import (
     ensure_ec_transfer_initialized,
     ensure_ec_transfer_shutdown,
@@ -46,11 +51,16 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+)
 from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
 from vllm.logger import logger
 from vllm.lora.request import LoRARequest
-from vllm.model_executor.model_loader.weight_checksum import compute_tensor_digests, zero_weights
+from vllm.model_executor.model_loader.weight_checksum import (
+    compute_tensor_digests,
+    zero_weights,
+)
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
@@ -69,7 +79,12 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.outputs import (
+    EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncModelRunnerOutput,
+    DraftTokenIds,
+    ModelRunnerOutput,
+)
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 from vllm.v1.worker.startup_plan import (
@@ -78,8 +93,6 @@ from vllm.v1.worker.startup_plan import (
 )
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
-
-import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.core.kv_cache_physical_plan import (
@@ -92,11 +105,19 @@ from vllm_ascend.core.kv_cache_placement import (
     register_kvpp_draft_layers,
 )
 from vllm_ascend.cpu_binding import bind_cpus
-from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
+from vllm_ascend.device.hardware_profile import (
+    HardwareCapability,
+    get_current_hardware_profile,
+)
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
-from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import uses_sfa_dspark_kv_transfer
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
+    uses_sfa_dspark_kv_transfer,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.cache_planner import (
+    get_spec_reuse_rules,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     build_layerwise_cache_layout,
     build_layerwise_reuse_layout,
@@ -305,7 +326,9 @@ class NPUWorker(WorkerBase):
 
     def set_metrics_level(self, level: str) -> str:
         """Set this worker process's MS metric level. Called by collective RPC."""
-        from vllm_ascend.observability.ms_metrics.control import apply_process_metrics_level
+        from vllm_ascend.observability.ms_metrics.control import (
+            apply_process_metrics_level,
+        )
 
         return apply_process_metrics_level(level)
 
@@ -605,7 +628,6 @@ class NPUWorker(WorkerBase):
         # Init ModelRunner here, so that we have access to self.device.
         if self.vllm_config.is_mm_encoder_only:
             from vllm.v1.worker.mm_encoder_model_runner import MMEncoderModelRunner
-
             from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
             with torch_cuda_wrapper():
@@ -852,7 +874,9 @@ class NPUWorker(WorkerBase):
         if getattr(self, "use_v2_model_runner", False):
             # Load V2 helpers only for V2 workers; V1 retains private allocation
             # and must keep its original multi-group budget scaling.
-            from vllm_ascend.worker.v2.attn_utils import can_share_full_and_sliding_kv_cache
+            from vllm_ascend.worker.v2.attn_utils import (
+                can_share_full_and_sliding_kv_cache,
+            )
 
             shares_attention_pool = can_share_full_and_sliding_kv_cache(self.vllm_config, per_layer_specs)
         # TODO: The Step-3.5/3.7 models will be sunset in the future. Once they
@@ -1229,6 +1253,11 @@ class NPUWorker(WorkerBase):
         physical_layers = {get_physical_layer_index(layer_name, base_layers) for layer_name in target_specs}
         num_layers = len(physical_layers)
         if num_layers < base_layers:
+            return num_layers, num_layers, 1.0
+        # Registered planners (including Qwen) are already priced by Core's
+        # one-block probe. Applying the generic logical multiplier again would
+        # overcommit memory; retain it only for unregistered legacy models.
+        if config is not None and get_spec_reuse_rules(config) is not None:
             return num_layers, num_layers, 1.0
         # Physical builders already account for the final shared backings.
         # Consume that same layout rather than applying a logical multiplier.

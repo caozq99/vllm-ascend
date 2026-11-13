@@ -28,8 +28,13 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
-
 from vllm_ascend.core.kv_cache_physical_plan import get_physical_kv_cache_config
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.cache_planner import (
+    get_spec_reuse_rules,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.cache_views import (
+    LayerwiseCacheConfig,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     get_layerwise_kv_cache_specs,
     get_layerwise_reuse_config,
@@ -48,8 +53,13 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_pool_bytes_per_block,
 )
 from vllm_ascend.models.glm5next.kv_cache import is_glm5_next_cache_spec
-from vllm_ascend.models.kimi_k3.cache_config import _get_kimi_k3_dspark_mixed_kv_cache_groups
-from vllm_ascend.models.kimi_k3.paired_sfa_cache import paired_sfa_cache_groups, paired_sfa_pool_bytes
+from vllm_ascend.models.kimi_k3.cache_config import (
+    _get_kimi_k3_dspark_mixed_kv_cache_groups,
+)
+from vllm_ascend.models.kimi_k3.paired_sfa_cache import (
+    paired_sfa_cache_groups,
+    paired_sfa_pool_bytes,
+)
 from vllm_ascend.models.qwen4_exp.cache_config import (
     get_qwen4_exp_pool_bytes_per_block,
 )
@@ -105,6 +115,8 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
             plan.kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
             return plan
         plan = super().get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, num_blocks)
+        if getattr(plan, "layerwise_component_plan", False):
+            return plan
         extra = get_layerwise_reuse_config(getattr(vllm_config, "kv_transfer_config", None))
         if extra is not None:
             base_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
@@ -131,12 +143,17 @@ class AscendKVCacheConfigBuilder(DefaultKVCacheConfigBuilder):
         vllm_config: VllmConfig,
         kv_cache_groups: list[KVCacheGroupSpec],
     ) -> int:
-        """One global block ID consumes sum(page sizes) x layer tuples.
+        """Count physical device bytes per block, including layerwise reuse.
 
-        The default implementation materializes a one-block pool and requires a
-        single device backing size, which the DSV4 shared-tuple, the TurboQuant
-        packed, the DSV4.1, and the GLM-Next layouts all violate.
+        Native multi-allocation layouts retain their existing accounting.
         """
+        extra_config = get_layerwise_reuse_config(getattr(vllm_config, "kv_transfer_config", None))
+        if extra_config is not None and kv_cache_groups and get_spec_reuse_rules(vllm_config) is not None:
+            num_layers = vllm_config.model_config.get_total_num_hidden_layers()
+            if LayerwiseCacheConfig.has_layer_reuse_for_stage(num_layers, extra_config):
+                plan = self.get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, num_blocks=1)
+                if getattr(plan, "layerwise_kv_cache_reuse", False):
+                    return next(tensor.size for tensor in plan.kv_cache_tensors if not tensor.host_resident)
         if vllm_config.model_config.hf_config.model_type == "kimi_k31":
             return paired_sfa_pool_bytes(kv_cache_groups)
         if is_deepseek_v41_cache(kv_cache_groups):

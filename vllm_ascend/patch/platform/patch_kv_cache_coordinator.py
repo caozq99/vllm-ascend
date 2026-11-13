@@ -638,7 +638,11 @@ def get_kv_cache_coordinator(  # type: ignore[misc]
             use_eagle=use_eagle,
             # A SWA-only bounded-replay backbone has no persistent KV to hit.
             # Keep its private managers without constructing a hybrid lookup.
-            enable_caching=enable_caching and num_cacheable_groups > 0,
+            enable_caching=(
+                enable_caching
+                and num_cacheable_groups > 0
+                and not getattr(kv_cache_config, "layerwise_kv_cache_reuse", False)
+            ),
             enable_kv_cache_events=enable_kv_cache_events,
             dcp_world_size=dcp_world_size,
             pcp_world_size=1,

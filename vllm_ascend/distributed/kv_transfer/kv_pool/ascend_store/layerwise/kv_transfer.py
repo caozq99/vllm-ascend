@@ -31,7 +31,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import ChunkedTokenDatabase, ReqMeta
 
-from .layerwise_cache_layout import reuse_sources
 
 _KVPOOL_RANGE_DEBUG_PREFIX = "[KVPOOL_RANGE_DEBUG]"
 
@@ -262,10 +261,15 @@ class LayerBatchBuilder:
             return self._build_key_major_shared(task, is_save)
 
         total = 0
+        public_blocks = {}
         for block_range in task.block_ranges:
             total += block_range.end_block - block_range.start_block
             if block_range.partial_block_index is not None:
                 total += 1
+            request = block_range.request
+            if is_save and task.group_id in request.public_save_blocks and id(request) not in public_blocks:
+                public_blocks[id(request)] = request.public_save_blocks[task.group_id]
+                total += len(public_blocks[id(request)][0])
 
         block_ids_arr, block_gvas_arr = self._ensure_buf(total)
         req_ids: list[str] = []
@@ -316,6 +320,12 @@ class LayerBatchBuilder:
                 block_ids_arr[offset] = block_ids_np[block_range.partial_block_index]
                 block_gvas_arr[offset] = partial_block_gva
                 offset += 1
+
+            public = public_blocks.pop(id(request), None)
+            if public is not None:
+                end = offset + len(public[0])
+                block_ids_arr[offset:end], block_gvas_arr[offset:end] = public
+                offset = end
 
         block_ids_slice = block_ids_arr[:offset]
         block_gvas_slice = block_gvas_arr[:offset]
@@ -728,20 +738,14 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
         self.final_layer_id = num_layers - 1
         self.layer_offset = layer_offset
 
-    def _wait_for_save(self, layer_id: int) -> bool:
-        if not self._wait_for_event(self.layer_save_finished_events[layer_id]):
-            return False
-        logger.debug("Key-based layer save event cleared: layer %d", layer_id)
-        self.layer_save_finished_events[layer_id].clear()
-        return True
-
     def _handle_request(  # type: ignore[override]
         self, data: LayerLoadTask
     ):
-        wait_for_save = data.wait_for_save_layer
         layer_id = data.layer_id
-        if wait_for_save is not None and not self._wait_for_save(wait_for_save):
-            data.transfer_tasks.clear()
+        for source in data.wait_for_save_layers:
+            if not self._wait_for_event(self.layer_save_finished_events[source]):
+                data.transfer_tasks.clear()
+                break
 
         if data.attention_start_gate is not None:
             if not self._wait_for_event(data.attention_start_gate):
@@ -1238,18 +1242,23 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     self.set_finished_request(req_id)
             self._active_load_indices = None
 
+    def _wait_for_reuse_saves(self, data: LayerLoadTask) -> bool:
+        for source in data.wait_for_save_layers:
+            if not self._wait_for_event(self.layer_save_finished_events[source], self.save_failure_checker):
+                return False
+            if self.save_failure_checker is not None:
+                self.save_failure_checker()
+            # CPU completion on a non-writing rank only records the NPU event.
+            self.sync_save_events[source].synchronize()
+            if self.external_slot_release_waiter is not None:
+                self.external_slot_release_waiter(source)
+        return True
+
     def _handle_range_layer_task(self, data: LayerLoadTask) -> None:
         layer_id = data.layer_id
         try:
-            wait_for_save = data.wait_for_save_layer
-            for source_layer in reuse_sources(wait_for_save):
-                if not self._wait_for_event(self.layer_save_finished_events[source_layer], self.save_failure_checker):
-                    return
-                if self.save_failure_checker is not None:
-                    self.save_failure_checker()
-                self.sync_save_events[source_layer].synchronize()
-                if isinstance(data.wait_for_save_layer, int):
-                    self.layer_save_finished_events[source_layer].clear()
+            if not self._wait_for_reuse_saves(data):
+                return
 
             if data.attention_start_gate is not None:
                 if not self._wait_for_event(data.attention_start_gate):
@@ -1316,23 +1325,11 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def _copy_gva_layers(self, data: LayerLoadTask) -> bool:
         # Layerwise threads only run when the worker-side
         # protocol gate is on; every store call below sits on the Backend ABC.
-        wait_for_save = data.wait_for_save_layer
         transfer_tasks = data.transfer_tasks
         layer_id = data.layer_id
         attention_start_gate = data.attention_start_gate
-
-        for source_layer in reuse_sources(wait_for_save):
-            if not self._wait_for_event(self.layer_save_finished_events[source_layer], self.save_failure_checker):
-                return False
-            if self.save_failure_checker is not None:
-                self.save_failure_checker()
-            # Non-saving TP ranks have no D2H task to synchronize the event.
-            # Their CPU save-finished signal only means the event was recorded;
-            # wait for the NPU work before reusing the local HBM buffer.
-            self.sync_save_events[source_layer].synchronize()
-            logger.debug("Layer save event cleared: layer %d", wait_for_save)
-            if isinstance(data.wait_for_save_layer, int):
-                self.layer_save_finished_events[source_layer].clear()
+        if not self._wait_for_reuse_saves(data):
+            return False
 
         if self.load_disabled.is_set():
             if self.external_slot_release_waiter is not None:
