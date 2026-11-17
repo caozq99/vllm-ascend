@@ -485,7 +485,7 @@ class NPUModelRunner(GPUModelRunner):
                 else set()
             )
         with graph_manager_wrapper(self):
-            self._initialize_kv_cache_upstream(kv_cache_config, kv_cache_allocation_context)
+            self._initialize_kv_cache_upstream(kv_cache_config, is_profiling, kv_cache_allocation_context)
             self._target_uses_flashmla = self._has_target_flashmla_attention()
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)

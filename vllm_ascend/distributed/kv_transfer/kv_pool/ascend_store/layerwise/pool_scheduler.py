@@ -380,3 +380,36 @@ class LayerwiseKVPoolScheduler(BaseKVPoolScheduler):
             head_or_tp_ranks = self.tp_size
         else:
             head_or_tp_ranks = self.tp_size // self.put_step
+        # The current key builder enumerates PCP/DCP coordinates separately.
+        # Multiplying ranks here would request extra keys no worker publishes.
+        keys = self.layerwise_keys.make_hit_check_keys(group_id, block_hash_hex, head_or_tp_ranks)
+        if draft_keys is not None:
+            keys.extend(draft_keys.make_hit_check_keys(block_hash_hex))
+        return keys
+
+    def _query_layerwise_block_hits(self, keys_by_block: list[list[str]]) -> list[bool]:
+        """Probe backend readability and fold physical keys into block hits."""
+        all_keys = [key for block_keys in keys_by_block for key in block_keys]
+        if not all_keys:
+            return []
+
+        keys_per_block = max(len(block_keys) for block_keys in keys_by_block)
+        batch_size = (
+            self.layerwise_max_transfer_blocks * keys_per_block
+            if self.layerwise_max_transfer_blocks > 0
+            else len(all_keys)
+        )
+        readable: list[bool] = []
+        for start in range(0, len(all_keys), batch_size):
+            batch = all_keys[start : start + batch_size]
+            batch_readable = self.store_scheduler.batch_is_readable(batch)
+            if len(batch_readable) != len(batch) or any(type(state) is not bool for state in batch_readable):
+                raise RuntimeError("Layerwise readability probe returned invalid results")
+            readable.extend(batch_readable)
+
+        block_hits = []
+        offset = 0
+        for block_keys in keys_by_block:
+            block_hits.append(all(readable[offset : offset + len(block_keys)]))
+            offset += len(block_keys)
+        return block_hits
