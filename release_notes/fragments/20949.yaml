@@ -1,4 +1,4 @@
-pr: 21256
+pr: 20949
 entries:
   - category: feature
     text: Enabled Qwen4Exp prefill KV offload through the shared model-rule layerwise planner, including QSA main KV, GDN state, and compressed indexer cache reuse.

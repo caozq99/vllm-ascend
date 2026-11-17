@@ -804,6 +804,12 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
             if writes is None:
                 raise RuntimeError(f"Mooncake Push is missing the shared-slot save hook for layer {source}")
             wait_futures(writes)
+            for future in writes:
+                # Completion alone does not prove the source bytes were sent.
+                # WRITE reports failures either as exceptions or error strings.
+                error = future.result()
+                if error:
+                    raise RuntimeError(f"Mooncake Push shared-slot WRITE failed for layer {source}: {error}")
 
     def save_kv_layer(self, layer_name: str) -> None:
         if not self.kv_transfer_config.is_kv_producer or not self._prefilling_request_ids:

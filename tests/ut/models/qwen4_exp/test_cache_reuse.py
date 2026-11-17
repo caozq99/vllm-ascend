@@ -214,3 +214,52 @@ def test_unregistered_model_keeps_native_placement():
     apply_layerwise_kv_cache_plan(config, runtime)
     assert config.kv_cache_tensors == original
     assert not getattr(config, "layerwise_kv_cache_reuse", False)
+
+
+@pytest.mark.parametrize("backend,verified_prefix", [("memcache", False), ("mooncake", True)])
+def test_prefix_verification_matches_backend_data_plane(backend, verified_prefix):
+    """GVA scratch hashes must not opt into Mooncake's block-key verification."""
+    groups = _groups()
+    runtime = _runtime()
+    runtime.kv_transfer_config.kv_connector_extra_config["backend"] = backend
+    runtime.kv_transfer_config.kv_role = "kv_producer"
+    cost = get_qwen4_exp_pool_bytes_per_block(groups)
+    config = get_qwen4_exp_kv_cache_config(runtime, groups, 3 * cost)
+    apply_layerwise_kv_cache_plan(config, runtime, native_backing_bytes=3 * cost)
+    assert config.layerwise_kv_cache_reuse
+    assert config.layerwise_component_plan
+    assert config.layerwise_store_verified_prefix is verified_prefix
+
+
+@pytest.mark.parametrize("block_outermost", [False, True])
+def test_native_group_can_mix_resident_and_reused_components(block_outermost):
+    """A transfer selector needs component identity, not just group/layer reuse."""
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_groups
+
+    from vllm_ascend.models.qwen4_exp.cache_config import get_qwen4_exp_kv_cache_groups
+
+    runtime = _runtime(buffers=8, independent=[])
+    runtime.scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+    runtime.cache_config.get_resolved_kv_cache_layout = lambda: SimpleNamespace(is_block_outermost=block_outermost)
+    runtime.kv_transfer_config.kv_connector_extra_config["backend"] = "mooncake"
+    runtime.kv_transfer_config.kv_role = "kv_producer"
+    specs = {
+        name: group.kv_cache_spec.kv_cache_specs[name]
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        else group.kv_cache_spec
+        for group in _groups()
+        for name in group.layer_names
+    }
+    groups = get_qwen4_exp_kv_cache_groups(runtime, specs, get_kv_cache_groups)
+    cost = get_qwen4_exp_pool_bytes_per_block(groups)
+    config = get_qwen4_exp_kv_cache_config(runtime, groups, 3 * cost)
+    apply_layerwise_kv_cache_plan(config, runtime, native_backing_bytes=3 * cost)
+    reused = config.layerwise_reuse_layout.reused_cache_names
+    # These are real QSA main and compressed owners in one scheduler group.
+    # Both are eligible, but only one actually shares its physical slot.
+    layer = 15 if block_outermost else 3
+    main = f"model.layers.{layer}.self_attn.attn"
+    compressed = f"model.layers.{layer}.self_attn.indexer.compressed_key_cache"
+    assert any(main in group.layer_names and compressed in group.layer_names for group in groups)
+    assert main not in reused
+    assert compressed in reused

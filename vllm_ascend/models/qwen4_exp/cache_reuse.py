@@ -13,7 +13,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import SpecReuseRules
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.cache_views import SpecReuseRules
 
 
 def _is_gdn_state(spec: KVCacheSpec) -> bool:

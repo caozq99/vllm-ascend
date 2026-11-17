@@ -170,6 +170,9 @@ class LayerTransferTask:
     use_key_major_ranges: bool = False
     # Group-local completion differs from the physical model layer boundary.
     final_group_layer: bool = False
+    # Layer-local transfer-entry indices. None keeps the full wire layout;
+    # an empty tuple selects no payload. Offsets never compact after selection.
+    component_indices: tuple[int, ...] | None = None
 
 
 @dataclass

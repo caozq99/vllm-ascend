@@ -345,7 +345,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                 self.independent_layers = cache_layout.independent_layers
                 self.num_prefetch_layers = cache_layout.num_prefetch_layers
             else:
-                stage_globals = list(layout.layer_cache_specs)
+                # Match the sorted global-to-local map built from physical caches,
+                # not cache-group insertion order (e.g. attention then recurrent).
+                stage_globals = sorted(layout.layer_cache_specs)
                 if stage_globals:
                     self.num_layers = self.layerwise_key_layers = len(stage_globals)
                     self.prefetch_layer_map, self.independent_layers = self._remap_layout_to_stage_local(
@@ -1773,6 +1775,28 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             ]
         return tuple(result)
 
+    def _reused_component_indices(
+        self, group_id: int, layer_idx_in_group: int
+    ) -> tuple[int, ...] | None:
+        layout = getattr(self, "_layerwise_reuse_layout", None)
+        reused_names = getattr(layout, "reused_cache_names", None)
+        if reused_names is None:
+            return None  # Legacy layouts have no component-level decisions.
+        names = self.group_cache_entry_names[group_id]
+        offsets = self.group_layer_cache_entry_offsets[group_id]
+        start, end = offsets[layer_idx_in_group : layer_idx_in_group + 2]
+        return tuple(index for index, name in enumerate(names[start:end]) if name in reused_names)
+
+    def _load_component_indices(
+        self, request: ReqMeta, group_id: int, layer_idx_in_group: int
+    ) -> tuple[int, ...] | None:
+        if not self.layerwise_offload:
+            return None
+        spec = request.load_spec
+        if spec is not None and not spec.layerwise_previous_step:
+            return None  # Fresh external hits must restore resident owners too.
+        return self._reused_component_indices(group_id, layer_idx_in_group)
+
     def _process_load_for_layer_batch(
         self,
         requests: list[ReqMeta],
@@ -1895,11 +1919,17 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                         partial_block_index=partial_block_index,
                     )
                 )
-        if request_block_ranges:
+        selected_ranges: dict[tuple[int, ...] | None, list[LayerBlockRange]] = {}
+        for block_range in request_block_ranges:
+            selection = self._load_component_indices(block_range.request, group_id, layer_idx_in_group)
+            if selection != ():
+                selected_ranges.setdefault(selection, []).append(block_range)
+        for selection, ranges in selected_ranges.items():
             self.layer_load_tasks[layer_id].append(
                 LayerTransferTask(
                     layer_id=layer_id,
-                    block_ranges=request_block_ranges,
+                    block_ranges=ranges,
+                    component_indices=selection,
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
                     use_key_major_ranges=self.use_block_key_layerwise,
@@ -1907,6 +1937,31 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     == getattr(self, "group_num_layers", {}).get(group_id, self.num_layers) - 1,
                 )
             )
+
+    def _layerwise_load_snapshot_start(self, request: ReqMeta, group_id: int, cached_tokens: int) -> int | None:
+        """Use the preceding save's key namespace, not this step's hash availability."""
+        spec = request.load_spec
+        if (
+            not self.layerwise_offload
+            or self.group_uses_align_state[group_id]
+            or spec is None
+            or cached_tokens <= 0
+            or spec.layerwise_snapshot_end_token is None
+            or spec.layerwise_snapshot_end_token < cached_tokens
+        ):
+            return None
+        start_block = (
+            spec.layerwise_snapshot_start_block
+            if spec.layerwise_snapshot_start_block is not None
+            else spec.layerwise_snapshot_block_index
+        )
+        if start_block is None:
+            return None
+        # RequestTracker records snapshot blocks in the transfer LCM unit;
+        # each group addresses pages in its own block size.
+        transfer_size = getattr(self, "cache_transfer_granularity", self.grouped_block_size[group_id])
+        return start_block * transfer_size // self.grouped_block_size[group_id]
+
 
     def _resolve_layerwise_load_partial(
         self,
@@ -2398,7 +2453,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         # Block selection is independent of layer addresses. Build each group
         # once (twice for resident vs reused loads), then share the ranges.
         saves: dict[int, list[LayerTransferTask]] = {}
-        loads: dict[tuple[int, bool], list[LayerTransferTask]] = {}
+        loads: dict[tuple[int, bool, tuple[int, ...] | None], list[LayerTransferTask]] = {}
         independent = set(self.independent_layers)
         for layer in range(num_layers):
             for group, index in self._groups_for_layerwise_transfer(layer):
@@ -2418,7 +2473,9 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                         )
                         for task in saves[group]
                     )
-                key = (group, layer in independent)
+                # Cached task templates must not leak one layer's component
+                # selection into another layer in the same scheduler group.
+                key = (group, layer in independent, self._reused_component_indices(group, index))
                 if key not in loads:
                     before = len(self.layer_load_tasks[layer])
                     self._process_load_for_layer_batch(group_requests[group], layer, group, index)

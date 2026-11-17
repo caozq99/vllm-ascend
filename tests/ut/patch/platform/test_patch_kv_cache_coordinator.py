@@ -438,5 +438,20 @@ def test_per_group_lookup_matches_scheduler_call_convention():
     assert hit_lengths == (4095, 4095)
 
 
+@pytest.mark.parametrize("reuse,verified,expected", [(True, True, True), (True, False, False), (False, False, True)])
+def test_single_group_factory_preserves_store_verified_prefix(monkeypatch, reuse, verified, expected):
+    config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["model.layers.0.attn"], kv_cache_spec=FA_SPEC)],
+        kv_cache_tensors=[],
+    )
+    config.layerwise_kv_cache_reuse = reuse
+    config.layerwise_store_verified_prefix = verified
+    original = Mock()
+    monkeypatch.setattr(mod, "_orig_get_kv_cache_coordinator", original)
+    mod.get_kv_cache_coordinator(config, max_model_len=1024, enable_caching=True)
+    assert original.call_args.kwargs["enable_caching"] is expected
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -25,6 +25,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_transfer import _LayerRevokeTask
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     LayerwiseCacheTopology,
+    reuse_sources,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_scheduler import LayerwiseKVPoolScheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -42,7 +43,11 @@ class TestMooncakeOffload(unittest.TestCase):
         spec = FullAttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype="uint8")
         if native_mtp:
             names.append("model.layers.4.kv")
-        config = SimpleNamespace(num_blocks=num_blocks, kv_cache_groups=[KVCacheGroupSpec(names, spec)])
+        config = SimpleNamespace(
+            num_blocks=num_blocks,
+            kv_cache_groups=[KVCacheGroupSpec(names, spec)],
+            prefix_cache_retention_interval=None,
+        )
         if native_mtp:
             config.layerwise_draft_layer_names = (names[-1],)
             config.layerwise_cache_topology = LayerwiseCacheTopology(
@@ -187,7 +192,7 @@ class TestMooncakeOffload(unittest.TestCase):
 
     def test_hybrid_main_pack_reuses_attention_and_recurrent_groups(self):
         worker, arrays, errors = self.make_ring(hybrid=True)
-        self.assertEqual(worker.prefetch_layer_map, {2: 0, 3: 1})
+        self.assertEqual(worker.prefetch_layer_map, {2: (0,), 3: (1,)})
         for end in (16, 32, 48):
             previous = end - 16
             request = self.request(end, previous=previous, last=end == 48)
@@ -322,7 +327,7 @@ class TestMooncakeOffload(unittest.TestCase):
     def test_mtp_reuses_aligned_kda_execution_snapshots(self):
         worker, arrays, errors = self.make_ring(hybrid=True, block_size=16, num_blocks=9)
         worker.vllm_config.speculative_config = SimpleNamespace(method="deepseek_mtp", num_speculative_tokens=3)
-        worker.prefetch_layer_map = {layer: (source,) for layer, source in worker.prefetch_layer_map.items()}
+        worker.prefetch_layer_map = {layer: reuse_sources(source) for layer, source in worker.prefetch_layer_map.items()}
         # Both successors observe source 1's save in this step; the first
         # waiter must not consume its event before the second waiter sees it.
         worker.prefetch_layer_map[2] = (0, 1)

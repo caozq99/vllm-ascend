@@ -598,6 +598,7 @@ class BaseKVPoolWorker(ABC):
         group_block_lens: list[int] = []
         group_block_strides: list[int] = []
         group_cache_entry_segments: list[tuple[int, int]] = []
+        group_cache_entry_names: list[str] = []
         layer_names_by_physical: dict[int, list[str]] = {}
         for layer_name in layer_names:
             phys = self._extract_physical_layer_index(layer_name)
@@ -622,6 +623,7 @@ class BaseKVPoolWorker(ABC):
                 for segments in cache_segments:
                     for segment_index, (base_addr, block_len, block_stride) in enumerate(segments):
                         group_cache_entry_segments.append((segment_index, len(segments)))
+                        group_cache_entry_names.append(layer_name)
                         group_addrs.append(base_addr)
                         group_block_lens.append(block_len)
                         group_block_strides.append(block_stride)
@@ -639,6 +641,11 @@ class BaseKVPoolWorker(ABC):
         self.group_block_stride[group_id] = group_block_strides
         self.group_layer_cache_entry_offsets[group_id] = layer_cache_entry_offsets
         self.group_cache_entry_segments[group_id] = group_cache_entry_segments
+        # Preserve owner identity after K/V coalescing and strided segmentation.
+        # A group/physical layer can contain both resident and reused owners.
+        if not hasattr(self, "group_cache_entry_names"):
+            self.group_cache_entry_names = {}
+        self.group_cache_entry_names[group_id] = group_cache_entry_names
         self.group_num_layers[group_id] = len(layer_names_by_physical)
 
     def _align_kv_ptrs(self, registered_regions: dict[int, tuple[int, int]]):
@@ -725,6 +732,7 @@ class BaseKVPoolWorker(ABC):
         self.group_block_stride: dict[int, list[int]] = {}
         self.group_layer_cache_entry_offsets: dict[int, list[int]] = {}
         self.group_cache_entry_segments: dict[int, list[tuple[int, int]]] = {}
+        self.group_cache_entry_names: dict[int, list[str]] = {}
         self.kv_caches = kv_caches
         if self.use_kvpp:
             self.physical_layer_to_group_layers.clear()

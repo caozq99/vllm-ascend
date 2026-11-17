@@ -334,7 +334,12 @@ class LayerwiseCachePlanner:
         # Store must validate reusable prefixes, and allocation must use exactly
         # the same single backing and byte windows as the physical planner.
         self.config.layerwise_component_plan = layout.has_layer_reuse
-        self.config.layerwise_store_verified_prefix = layout.has_layer_reuse
+        # Only block-key stores verify that a reusable prefix still exists.
+        # GVA slots are overwritten in place, so their stale hashes must not
+        # opt into the Store-only prefix admission path.
+        self.config.layerwise_store_verified_prefix = (
+            layout.has_layer_reuse and backend is not None and backend.layerwise_data_plane == "block_key"
+        )
         if layout.has_layer_reuse and self.draft_names:
             self.config.layerwise_draft_layer_names = tuple(sorted(self.draft_names))
 

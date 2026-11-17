@@ -506,7 +506,11 @@ def test_worker_preserves_generic_mtp_draft_bytes_in_reuse_budget():
     worker = NPUWorker.__new__(NPUWorker)
     worker.model_config = SimpleNamespace(get_num_layers=lambda parallel: 4)
     worker.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
-    worker.vllm_config = SimpleNamespace(speculative_config=SimpleNamespace(method="deepseek_mtp"))
+    # Registered-rule dispatch reads model metadata before the generic fallback.
+    worker.vllm_config = SimpleNamespace(
+        model_config=worker.model_config,
+        speculative_config=SimpleNamespace(method="deepseek_mtp"),
+    )
     extra = {"backend": "mooncake", "layerwise_num_shared_buffers": 1, "layerwise_independent_layers": []}
     spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=8, dtype=torch.int8)
     specs = {f"model.layers.{i}.attn": spec for i in range(5)}
