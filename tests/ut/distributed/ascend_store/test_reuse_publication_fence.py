@@ -28,7 +28,8 @@ class TestReusePublicationFence(unittest.TestCase):
             (True, True, 16, True),
             (True, True, 1, False),
             (True, False, 16, False),
-            (False, True, 16, False),
+            (False, True, 16, True),
+            (False, False, 16, False),
         ]:
             for requests in ([], [object()]):
                 with self.subTest(transfer=transfer, reuse=reuse, tp_size=tp_size, empty=not requests):
@@ -36,8 +37,10 @@ class TestReusePublicationFence(unittest.TestCase):
                     worker.use_layerwise = True
                     worker.use_kvpp = False
                     worker.use_layerwise_transfer = transfer
+                    worker.use_block_key_layerwise = not transfer
                     worker.layerwise_offload = reuse
                     worker.tp_size = tp_size
+                    worker.pcp_size = 1
                     worker._save_disabled = threading.Event()
                     worker.kv_recv_thread = None
                     calls: list[str] = []
