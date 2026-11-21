@@ -158,3 +158,28 @@ def test_dense_scaled_control(mode):
     expected = torch.full_like(source, -1)
     expected[45:90].copy_(source[45:90])
     assert torch.equal(dest, expected)
+
+
+def test_block_key_selected_component_keeps_original_object_offset():
+    scale = 3
+    _, views = components(scale, padding=3, dtype=torch.bfloat16)
+    dense = torch.zeros((9, 2, 8), dtype=torch.bfloat16)
+    worker = make_worker({"model.layers.0.attn": (dense,), "model.layers.1.attn": views}, layerwise=True)
+    database = make_database(worker, scale)
+    builder = LayerBatchBuilder(database, sum(database.group_block_len[0]), 2)
+    shared = SharedBlockData(
+        block_ids_arr=np.array([1], dtype=np.int64),
+        block_gvas_arr=None,
+        req_ids=["regression"],
+        is_last_chunks=[True],
+        block_keys=["regression-key"],
+    )
+
+    selected = builder.build_addrs(shared, 1, component_indices=(1,))
+    dense_bytes = dense[0].numel() * dense.element_size()
+    first_component_bytes = views[0][:scale].numel() * views[0].element_size()
+    assert selected.all_offsets == [[dense_bytes + first_component_bytes]]
+    base = worker.group_kv_caches_base_addr[0][2]
+    stride = worker.group_block_stride[0][2]
+    assert selected.all_buffers == [[base + stride]]
+    assert selected.all_sizes == [[worker.group_block_len[0][2]]]

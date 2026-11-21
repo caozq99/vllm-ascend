@@ -148,6 +148,8 @@ class SharedBlockData:
     block_keys: list[str] | None = None
     save_keys: list[str] = field(default_factory=list)
     load_keys: list[str] = field(default_factory=list)
+    # Range receivers share this selection only within one step.
+    range_failed_indices: set[int] | None = field(default=None, init=False, repr=False, compare=False)
 
 
 @dataclass
@@ -164,6 +166,8 @@ class LayerTransferTask:
     use_key_major_ranges: bool = False
     # Group-local completion differs from the physical model layer boundary.
     final_group_layer: bool = False
+    # Indices into the full layer object; None transfers all components.
+    component_indices: tuple[int, ...] | None = None
 
 
 @dataclass

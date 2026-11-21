@@ -283,6 +283,20 @@ def test_prefix_hit_publishes_cached_prefix_and_new_token_range(producer_schedul
     assert chunk.local_block_ids == ((1, 2, 3), (11, 12, 13))
 
 
+@pytest.mark.parametrize("producer_hit", [0, 16])
+def test_producer_and_decoder_external_prefix_tokens_are_independent(producer_scheduler, producer_hit):
+    request = prefill_request()
+    blocks = ([1, 2, 3], [11, 12, 13])
+    producer_scheduler.update_state_after_alloc(request, SimpleNamespace(get_block_ids=lambda: blocks), producer_hit)
+    new = step(request, blocks)
+    new.scheduled_new_reqs[0].num_computed_tokens = 16
+    cached = step(request, None, computed=32)
+    for output in (new, cached):
+        chunk = producer_scheduler.build_connector_meta(output).push_send_requests[request.request_id]
+        assert chunk.num_external_tokens == producer_hit
+        assert chunk.remote_num_external_tokens == 48
+
+
 @pytest.mark.parametrize("aborted", [False, True])
 def test_producer_delays_release_only_for_unfinished_abort(producer_scheduler, aborted):
     scheduler = producer_scheduler

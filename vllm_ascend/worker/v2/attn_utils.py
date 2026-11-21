@@ -1613,6 +1613,14 @@ def _reshape_kv_cache_v2(
         kv_cache_config.kv_cache_groups,
         kv_cache_config.num_blocks,
     )
+    reuse_block_strides = {}
+    if qwen4_cache_layout is not None and get_layerwise_reuse_layout(kv_cache_config) is not None:
+        reuse_block_strides = {
+            name: descriptor.block_stride
+            for descriptor in kv_cache_config.kv_cache_tensors
+            for name in get_kv_cache_tensor_layers(descriptor)
+        }
+
     for group in attn_groups:
         if group.kv_cache_group_id >= len(kernel_block_sizes):
             continue
@@ -1644,13 +1652,13 @@ def _reshape_kv_cache_v2(
                 continue
 
             if qwen4_cache_layout is not None:
-                # Model-owned Qwen4 hybrid view construction: each
-                # owner addresses its role's regions inside its own slot of
-                # the shared contiguous backing.
+                # A reuse allocation is already sliced at the owner's origin.
+                # Native QSA owners address their regions in the full slab.
                 owner = qwen4_cache_layout.owner(layer_name)
                 raw_slab = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_slab, torch.Tensor):
                     raise ValueError(f"Qwen4 hybrid cache for {layer_name} must use one raw tensor.")
+                reuse_stride = reuse_block_strides.get(layer_name)
                 slot_offset = owner.slot * qwen4_cache_layout.slot_backing_size
                 if owner.role == QSA_MAIN:
                     assert isinstance(kv_cache_spec, FullAttentionSpec)
@@ -1664,8 +1672,8 @@ def _reshape_kv_cache_v2(
                         num_kv_heads=kv_cache_spec.num_kv_heads,
                         head_size=kv_cache_spec.head_size,
                         head_size_v=kv_cache_spec.head_size_v,
-                        storage_offset=slot_offset + region.offset,
-                        block_stride=region.block_stride,
+                        storage_offset=slot_offset + region.offset if reuse_stride is None else 0,
+                        block_stride=region.block_stride if reuse_stride is None else reuse_stride,
                     )
                     continue
                 if owner.role in (QSA_RAW, QSA_COMPRESSED):
@@ -1689,6 +1697,7 @@ def _reshape_kv_cache_v2(
                             f"region={region.page_size_bytes}."
                         )
                     num_view_blocks = kv_cache_config.num_blocks
+                    kernel_pages = 1
                     if owner.role == QSA_COMPRESSED:
                         # Match MRV2's virtual block table and builder spec:
                         # each kernel page owns kernel_block_size / ratio keys.
@@ -1704,7 +1713,8 @@ def _reshape_kv_cache_v2(
                             storage_block_size,
                             kv_cache_spec.head_size,
                         ),
-                        storage_offset=slot_offset + region.offset,
+                        storage_offset=slot_offset + region.offset if reuse_stride is None else 0,
+                        block_stride=None if reuse_stride is None else reuse_stride // kernel_pages,
                     ).transpose(1, 2)
                     continue
                 if owner.role == PLE:
@@ -1722,6 +1732,8 @@ def _reshape_kv_cache_v2(
                 if owner.role == GDN:
                     assert isinstance(kv_cache_spec, MambaSpec)
                     region_names = ("r1", "r2")
+                    state_base = slot_offset if reuse_stride is None else 0
+                    state_origin = 0 if reuse_stride is None else qwen4_cache_layout.region("r1").offset
                     if len(region_names) != len(kv_cache_spec.shapes):
                         raise RuntimeError(
                             f"Invalid Qwen4 hybrid Mamba role/shape for {layer_name}: "
@@ -1733,8 +1745,12 @@ def _reshape_kv_cache_v2(
                             dtype=dtype,
                             num_blocks=kv_cache_config.num_blocks,
                             item_shape=tuple(shape),
-                            storage_offset=slot_offset + qwen4_cache_layout.region(region_name).offset,
-                            block_stride=qwen4_cache_layout.region(region_name).block_stride,
+                            storage_offset=state_base + qwen4_cache_layout.region(region_name).offset - state_origin,
+                            block_stride=(
+                                qwen4_cache_layout.region(region_name).block_stride
+                                if reuse_stride is None
+                                else reuse_stride
+                            ),
                         )
                         for shape, dtype, region_name in zip(
                             kv_cache_spec.shapes,
