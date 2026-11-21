@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+from collections import defaultdict
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from typing import Any, cast
@@ -936,10 +937,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
     def _open_layerwise_get_sessions(self, request_key_slots: list[tuple[ReqMeta, str, int, int | None]]) -> None:
         if not request_key_slots:
             return
-        keys = list(dict.fromkeys(key for _, key, _, _ in request_key_slots))
-        request_ids_by_key: dict[str, set[str]] = {}
+        request_ids_by_key: defaultdict[str, set[str]] = defaultdict(set)
         for request, key, _, _ in request_key_slots:
-            request_ids_by_key.setdefault(key, set()).add(request.req_id)
+            request_ids_by_key[key].add(request.req_id)
+        keys = list(request_ids_by_key)
         try:
             results = self._start_layerwise_get_keys(keys)
         except Exception as exc:
@@ -954,8 +955,7 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
             return
 
         results_by_key = dict(zip(keys, results, strict=True))
-        for key, result in results_by_key.items():
-            self._layerwise_session_tracker.record_get_result(key, request_ids_by_key[key], succeeded=result == 0)
+        self._layerwise_session_tracker.record_get_results(results_by_key, request_ids_by_key)
         request_load_keys: dict[int, list[str]] = {}
         request_seen_keys: dict[int, set[str]] = {}
         requests_by_id: dict[int, ReqMeta] = {}

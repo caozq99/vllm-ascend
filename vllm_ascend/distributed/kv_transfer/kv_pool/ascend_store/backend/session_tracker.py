@@ -83,6 +83,23 @@ class LayerwiseSessionTracker:
             else:
                 self._load_key_owners.pop(key, None)
 
+    def record_get_results(
+        self,
+        results_by_key: Mapping[str, int],
+        request_ids_by_key: Mapping[str, Iterable[str]],
+    ) -> None:
+        """Record one aligned GET-start batch under the tracker lock."""
+        with self._lock:
+            for key, result in results_by_key.items():
+                if result != 0:
+                    self._load_key_owners.pop(key, None)
+                    continue
+                owners = self._load_key_owners.get(key)
+                if owners is None:
+                    self._load_key_owners[key] = set(request_ids_by_key[key])
+                else:
+                    owners.update(request_ids_by_key[key])
+
     def release_failed_get_attempts(
         self,
         request_ids_by_key: Mapping[str, Iterable[str]],
