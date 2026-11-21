@@ -480,8 +480,8 @@ class LayerBatchBuilder:
                 block_ids=shared.block_ids_arr.tolist(),
                 keys=shared.block_keys,
                 all_buffers=all_buffers,
-                all_sizes=[sizes.copy() for _ in shared.block_ids_arr],
-                all_offsets=[offsets.copy() for _ in shared.block_ids_arr],
+                all_sizes=[sizes] * len(shared.block_ids_arr),
+                all_offsets=[offsets] * len(shared.block_ids_arr),
                 load_keys=shared.load_keys,
             )
 
