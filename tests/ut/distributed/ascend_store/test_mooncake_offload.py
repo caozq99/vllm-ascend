@@ -27,6 +27,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.planes.b
     snapshot_key,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_scheduler import LayerwiseKVPoolScheduler
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_worker import LayerwiseKVPoolWorker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
     LoadSpec,
@@ -515,3 +516,39 @@ class TestMooncakeOffload(unittest.TestCase):
         self.assertTrue(next_step.load_spec.layerwise_previous_step)
         self.assertEqual(next_step.target_token_len, 16396)
         self.assertEqual(next_step.load_spec.kvpool_cached_tokens, 16395)
+
+
+class TestMooncakeMixedRestore(unittest.TestCase):
+    def test_running_restore_excludes_resident_component_but_first_hit_does_not(self):
+        worker = LayerwiseKVPoolWorker.__new__(LayerwiseKVPoolWorker)
+        worker.layerwise_offload = worker.use_block_key_layerwise = True
+        worker.grouped_block_size = [16]
+        worker.num_layers = 1
+        worker._reused_layers_by_group = {0: {0}}
+        # This physical layer has two wire components. Only component 1 rotates.
+        worker.layerwise_component_indices = {(0, 0): (1,)}
+
+        for previous_step, expected in [(False, None), (True, (1,))]:
+            with self.subTest(previous_step=previous_step):
+                worker.layer_load_tasks = [[]]
+                request = ReqMeta("request", load_spec=LoadSpec(16, 16, True, layerwise_previous_step=previous_step))
+                request.load_block_keys = ["committed-block"]
+                worker._process_load_for_layer_batch([request], 0)
+                self.assertEqual(len(worker.layer_load_tasks[0]), 1)
+                task = worker.layer_load_tasks[0][0]
+                self.assertEqual(getattr(task, "component_indices", None), expected)
+
+    def test_running_restore_rejects_missing_compiled_component_registration(self):
+        worker = LayerwiseKVPoolWorker.__new__(LayerwiseKVPoolWorker)
+        worker.layerwise_offload = worker.use_block_key_layerwise = True
+        worker.grouped_block_size = [16]
+        worker.num_layers = 1
+        worker._reused_layers_by_group = {0: {0}}
+        worker._layerwise_reuse_layout = SimpleNamespace(reused_cache_names={"model.layers.0.kv"})
+        worker.layerwise_component_indices = {}
+        worker.layer_load_tasks = [[]]
+        request = ReqMeta("request", load_spec=LoadSpec(16, 16, True, layerwise_previous_step=True))
+        request.load_block_keys = ["committed-block"]
+        with self.assertRaisesRegex(RuntimeError, "Missing layerwise component registration"):
+            worker._process_load_for_layer_batch([request], 0)
+        self.assertFalse(worker.layer_load_tasks[0])

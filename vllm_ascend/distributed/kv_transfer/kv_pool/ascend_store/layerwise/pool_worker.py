@@ -1209,6 +1209,10 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
         block_size = get_group_block_size(self.grouped_block_size, group_id)
         reuses_buffer = self.layerwise_offload and layer_id in self._reused_layers_by_group.get(group_id, ())
         request_block_ranges = []
+        previous_step_ranges = []
+        selector = getattr(self, "layerwise_component_indices", {}).get((group_id, layer_idx_in_group))
+        compiled_layout = getattr(self, "_layerwise_reuse_layout", None)
+        requires_selector = bool(getattr(compiled_layout, "reused_cache_names", ()))
         for request in requests:
             if self.use_block_key_layerwise:
                 # Block-key sessions retain committed block ownership across
@@ -1228,7 +1232,18 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                     if not populated_slots:
                         continue
                     start, end = min(populated_slots), max(populated_slots) + 1
-                request_block_ranges.append(LayerBlockRange(request=request, start_block=start, end_block=end))
+                block_range = LayerBlockRange(request=request, start_block=start, end_block=end)
+                previous_step = request.load_spec is None or request.load_spec.layerwise_previous_step
+                if self.layerwise_offload and previous_step:
+                    if selector is not None:
+                        if selector:
+                            previous_step_ranges.append(block_range)
+                        continue
+                    if requires_selector:
+                        raise RuntimeError(
+                            f"Missing layerwise component registration for group {group_id}, layer {layer_idx_in_group}"
+                        )
+                request_block_ranges.append(block_range)
                 continue
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
@@ -1313,16 +1328,24 @@ class LayerwiseKVPoolWorker(BaseKVPoolWorker):
                         partial_block_index=partial_block_index,
                     )
                 )
-        if request_block_ranges:
+        # A batch may mix external first hits (whole object) and same-request
+        # restores (rotating segments only). Keep their range metadata separate.
+        batches = [
+            (ranges, indices)
+            for ranges, indices in ((request_block_ranges, None), (previous_step_ranges, selector))
+            if ranges
+        ]
+        for index, (ranges, indices) in enumerate(batches):
             self.layer_load_tasks[layer_id].append(
                 LayerTransferTask(
                     layer_id=layer_id,
-                    block_ranges=request_block_ranges,
+                    block_ranges=ranges,
                     group_id=group_id,
                     layer_idx_in_group=layer_idx_in_group,
                     use_key_major_ranges=self.use_block_key_layerwise,
-                    final_group_layer=layer_idx_in_group
-                    == getattr(self, "group_num_layers", {}).get(group_id, self.num_layers) - 1,
+                    final_group_layer=index == len(batches) - 1
+                    and layer_idx_in_group == getattr(self, "group_num_layers", {}).get(group_id, self.num_layers) - 1,
+                    component_indices=indices,
                 )
             )
 

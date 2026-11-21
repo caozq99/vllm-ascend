@@ -564,7 +564,7 @@ class TestMooncakeHybrid(unittest.TestCase):
                 ([4], [5]) if "state" in name else ([1, 2], [3, 4]) if "c4" in name else ([1, 2, 3, 4], [2, 3, 4, 5])
             )
             np.testing.assert_array_equal(array[dst], saved[name][src])
-        self.assertTrue(all(indices is None for indices in worker.kv_recv_thread._group_load_indices.values()))
+        self.assertFalse(worker._invalid_block_ids)
         self.assertFalse(errors)
         self.assertFalse(store.open_reads)
 

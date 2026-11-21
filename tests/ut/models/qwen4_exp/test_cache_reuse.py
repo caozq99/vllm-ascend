@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from tests.ut.models.test_qwen4_exp_cache_config import _allocate_mrv2_kv_cache
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.cache_planner import (
     LayerwiseCachePlanner,
     get_spec_reuse_rules,
@@ -218,3 +219,38 @@ def test_unregistered_model_keeps_native_placement():
     original = deepcopy(config.kv_cache_tensors)
     assert plan_layerwise_cache_reuse(config, runtime) is None
     assert config.kv_cache_tensors == original
+
+
+def test_mrv2_reshapes_mooncake_qwen_owner_views(monkeypatch):
+    groups = _groups()
+    runtime = _runtime()
+    runtime.kv_transfer_config.kv_connector_extra_config["backend"] = "mooncake"
+    config = get_qwen4_exp_kv_cache_config(runtime, groups, 3 * get_qwen4_exp_pool_bytes_per_block(groups))
+    layout = plan_layerwise_cache_reuse(config, runtime)
+    assert layout is not None and layout.has_layer_reuse
+    config = apply_layerwise_kv_cache_plan(config, runtime.kv_transfer_config, layout)
+
+    raw, caches, native_layout = _allocate_mrv2_kv_cache(
+        config, monkeypatch, use_main=True, kv_transfer_config=runtime.kv_transfer_config
+    )
+    strides = {name: tensor.block_stride for tensor in config.kv_cache_tensors for name in tensor.layers}
+    prefix = "model.layers.7.self_attn"
+    main = f"{prefix}.attn"
+    k, v = caches[main]
+    assert k.data_ptr() == raw[main].data_ptr()
+    assert k.stride(0) * k.element_size() == strides[main] // 2
+    assert k.shape == v.shape == (6, 128, 1, 64)
+
+    for suffix, kernel_pages in (("raw_key_cache", 1), ("compressed_key_cache", 2)):
+        name = f"{prefix}.indexer.{suffix}"
+        cache = caches[name]
+        assert cache.data_ptr() == raw[name].data_ptr()
+        assert cache.shape[0] == config.num_blocks * kernel_pages
+        assert cache.stride(0) * cache.element_size() == strides[name] // kernel_pages
+
+    name = "model.layers.4.linear_attn"
+    assert name in layout.reused_cache_names
+    conv, ssm = caches[name]
+    assert conv.data_ptr() == raw[name].data_ptr()
+    assert ssm.data_ptr() - conv.data_ptr() == native_layout.region("r2").offset - native_layout.region("r1").offset
+    assert conv.stride(0) * conv.element_size() == ssm.stride(0) * ssm.element_size() == strides[name]
